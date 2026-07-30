@@ -1,0 +1,2 @@
+# 每行一个内置 Skill 目录名
+web-access

@@ -1,0 +1,24 @@
+# 环境变量（含 API Key，不上传）
+.env
+.env.local
+.env.*.local
+
+# Maven
+target/
+.m2-repository/
+dependency-reduced-pom.xml
+
+# IDE
+.idea/
+*.iml
+
+# 日志
+logs/
+*.log
+
+# 记忆/会话数据（本地运行产生）
+.xcode/
+
+# 系统文件
+.DS_Store
+Thumbs.db
