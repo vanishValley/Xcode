@@ -78,18 +78,24 @@ public final class LessonExtractor {
     // ── 一站式入口 ──
 
     /**
-     * 完整流水线:有信号 → 提炼 → 有效 → 入库(去重+覆盖+数量限制)。
+     * 完整流水线:有信号 → 提炼 → 有效 → 交给长期记忆统一写入口。
      * 任一步失败静默跳过,不抛异常。
      */
     public static void tryExtract(List<Message> history, LlmClient llmClient,
-                                  KnowledgeBase kb, String projectPath) {
+                                  LongTermMemory memory, String projectPath) {
         try {
             if (!hasFailureThenSuccess(history)) return;
 
             String lesson = extract(history, llmClient);
             if (lesson == null || "无".equals(lesson) || lesson.isBlank()) return;
 
-            kb.saveAgent(lesson, projectPath);
+            // “失败→修正→成功”已经提供了可验证信号，因此作为高置信候选提交。
+            memory.save(MemoryRecord.create(
+                    lesson,
+                    MemoryScope.PROJECT,
+                    projectPath,
+                    MemorySource.AGENT,
+                    0.9));
         } catch (Exception ignored) {
             // best-effort:任何一步异常都不影响主流程
         }

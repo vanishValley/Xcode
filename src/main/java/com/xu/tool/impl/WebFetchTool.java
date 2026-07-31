@@ -103,11 +103,14 @@ public class WebFetchTool implements Tool {
                                     + "application/json;q=0.9,*/*;q=0.1")
                     .build();
 
-            try (Response response = httpClient.newCall(request).execute()) {
+            try {
+                FetchedResponse response = InterruptibleHttp.execute(
+                        httpClient.newCall(request),
+                        WebFetchTool::bufferResponse);
                 int code = response.code();
 
                 if (isRedirect(code)) {
-                    String location = response.header("Location");
+                    String location = response.location();
                     if (location == null || location.isBlank()) {
                         return failure("error", "INVALID_REDIRECT",
                                 "服务器返回重定向但缺少 Location", currentUrl);
@@ -125,30 +128,27 @@ public class WebFetchTool implements Tool {
                             "网页请求失败：" + response.message(), currentUrl);
                 }
 
-                contentType = response.header("Content-Type", "");
+                contentType = response.contentType();
                 if (!isSupportedContentType(contentType)) {
                     return failure("error", "UNSUPPORTED_CONTENT_TYPE",
                             "只支持 HTML、纯文本和 JSON，收到：" + contentType,
                             currentUrl);
                 }
 
-                ResponseBody body = response.body();
-                if (body == null) {
+                if (!response.hasBody()) {
                     return failure("error", "EMPTY_RESPONSE",
                             "网页响应体为空", currentUrl);
                 }
-                if (body.contentLength() > MAX_BODY_BYTES) {
-                    return failure("error", "BODY_TOO_LARGE",
-                            "网页响应超过 5MB 上限", currentUrl);
-                }
-                try {
-                    bodyText = readBodyWithLimit(body);
-                } catch (BodyTooLargeException e) {
-                    return failure("error", "BODY_TOO_LARGE",
-                            "网页响应超过 5MB 上限", currentUrl);
-                }
+                bodyText = response.bodyText();
                 break;
+            } catch (BodyTooLargeException e) {
+                return failure("error", "BODY_TOO_LARGE",
+                        "网页响应超过 5MB 上限", currentUrl);
             } catch (IOException e) {
+                if (e instanceof java.io.InterruptedIOException
+                        || Thread.currentThread().isInterrupted()) {
+                    throw e;
+                }
                 return failure("error", "NETWORK_ERROR",
                         safeMessage(e), currentUrl);
             }
@@ -384,6 +384,37 @@ public class WebFetchTool implements Tool {
             }
             return output.toString(charset);
         }
+    }
+
+    private static FetchedResponse bufferResponse(Response response)
+            throws IOException, BodyTooLargeException {
+        int code = response.code();
+        String contentType = response.header("Content-Type", "");
+        ResponseBody body = response.body();
+        boolean shouldRead = code >= 200
+                && code < 300
+                && isSupportedContentType(contentType)
+                && body != null;
+        if (shouldRead && body.contentLength() > MAX_BODY_BYTES) {
+            throw new BodyTooLargeException();
+        }
+        String bodyText = shouldRead ? readBodyWithLimit(body) : null;
+        return new FetchedResponse(
+                code,
+                response.message(),
+                response.header("Location"),
+                contentType,
+                body != null,
+                bodyText);
+    }
+
+    private record FetchedResponse(
+            int code,
+            String message,
+            String location,
+            String contentType,
+            boolean hasBody,
+            String bodyText) {
     }
 
     private static String safeMessage(Exception e) {

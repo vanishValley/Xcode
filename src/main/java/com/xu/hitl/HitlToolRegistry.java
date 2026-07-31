@@ -3,6 +3,7 @@ package com.xu.hitl;
 import com.xu.tool.Tool;
 import com.xu.tool.ToolExecutionResult;
 import com.xu.tool.ToolRegistry;
+import com.xu.util.CancellationToken;
 
 import java.util.Map;
 
@@ -13,15 +14,24 @@ import java.util.Map;
  * Agent 仍然调 tool.execute(), 但拿到的 Tool 是被偷偷替换过的——
  * execute() 里先走审批, 通过了才进原始逻辑。
  *
- * 审批委托给 HitlHandler: 现在 TerminalHitlHandler, 以后换 TUI 弹窗时这个类不改。
+ * 审批委托给 HitlHandler：plain 与 TUI 可以使用不同实现，本类不变。
  */
 public class HitlToolRegistry extends ToolRegistry {
 
     private final HitlHandler handler;
+    private final CancellationToken cancellation;
     private volatile boolean enabled = false;
 
     public HitlToolRegistry(HitlHandler handler) {
+        this(handler, new CancellationToken());
+    }
+
+    public HitlToolRegistry(
+            HitlHandler handler,
+            CancellationToken cancellation) {
         this.handler = handler;
+        this.cancellation = cancellation == null
+                ? new CancellationToken() : cancellation;
     }
 
     public void setEnabled(boolean e) { this.enabled = e; }
@@ -29,9 +39,7 @@ public class HitlToolRegistry extends ToolRegistry {
 
     /** 清空"全部放行"列表: /clear 或 /hitl off 时调用 */
     public void clearApprovalState() {
-        if (handler instanceof TerminalHitlHandler t) {
-            t.clearApprovedAll();
-        }
+        handler.clearSessionState();
     }
 
     @Override
@@ -58,9 +66,13 @@ public class HitlToolRegistry extends ToolRegistry {
             @Override
             public ToolExecutionResult executeObserved(
                     Map<String, Object> arguments) throws Exception {
-                ApprovalResult result = handler.requestApproval(original.name(), arguments);
+                cancellation.throwIfCancellationRequested();
+                ApprovalResult result = handler.requestApproval(
+                        original.name(), arguments);
+                cancellation.throwIfCancellationRequested();
 
                 if (result.isApproved()) {
+                    cancellation.throwIfCancellationRequested();
                     return original.executeObserved(arguments);
                 }
                 if (result.type() == ApprovalResult.Type.SKIPPED) {
@@ -75,4 +87,5 @@ public class HitlToolRegistry extends ToolRegistry {
             }
         };
     }
+
 }

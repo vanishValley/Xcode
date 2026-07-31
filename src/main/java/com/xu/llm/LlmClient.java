@@ -2,21 +2,33 @@ package com.xu.llm;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xu.observability.TraceScope;
 import com.xu.observability.Tracing;
 import okhttp3.OkHttpClient;
 import okhttp3.MediaType;
+import okhttp3.Call;
+import okhttp3.Callback;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InterruptedIOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Consumer;
 
 public class LlmClient {
 
@@ -29,6 +41,7 @@ public class LlmClient {
     private final OkHttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final Tracing tracing;
+    private final Set<Call> activeCalls = ConcurrentHashMap.newKeySet();
 
     public LlmClient(String apiKey, String model) {
         this(apiKey, model, Tracing.noop());
@@ -78,7 +91,9 @@ public class LlmClient {
                         .post(RequestBody.create(json, JSON))
                         .build();
 
-                try (Response response = httpClient.newCall(httpRequest).execute()) {
+                Call call = httpClient.newCall(httpRequest);
+                activeCalls.add(call);
+                try (Response response = executeInterruptibly(call)) {
                     scope.attribute("http.status_code", response.code());
                     String body = response.body().string();
                     if (!response.isSuccessful()) {
@@ -124,6 +139,8 @@ public class LlmClient {
                             .addKeyValue("duration_ms", scope.elapsedMillis())
                             .log("LLM 调用完成");
                     return choice.message;
+                } finally {
+                    activeCalls.remove(call);
                 }
             } catch (IOException | RuntimeException error) {
                 scope.fail(error);
@@ -136,6 +153,196 @@ public class LlmClient {
                         .log("LLM 调用失败");
                 throw error;
             }
+        }
+    }
+
+    /**
+     * Streams assistant text while still reconstructing the exact Message
+     * shape required by the ReAct loop, including fragmented tool calls.
+     */
+    public Message chatRawStreaming(
+            List<Message> messages,
+            List<Map<String, Object>> tools,
+            Consumer<String> onTextDelta) throws IOException {
+        Consumer<String> deltaConsumer =
+                onTextDelta == null ? ignored -> { } : onTextDelta;
+        try (TraceScope scope = tracing.startClient("llm.chat")
+                .attribute("gen_ai.model", model)
+                .attribute("llm.streaming", true)
+                .attribute("llm.message_count", messages.size())
+                .attribute("llm.tool_definition_count",
+                        tools == null ? 0L : tools.size())) {
+            try {
+                ChatRequest request =
+                        new ChatRequest(model, messages, true, tools);
+                String json = objectMapper.writeValueAsString(request);
+                scope.attribute("llm.request_chars", json.length());
+
+                Request httpRequest = new Request.Builder()
+                        .url(BASE_URL + "/chat/completions")
+                        .header("Authorization", "Bearer " + apiKey)
+                        .header("Accept", "text/event-stream")
+                        .post(RequestBody.create(json, JSON))
+                        .build();
+
+                Call call = httpClient.newCall(httpRequest);
+                activeCalls.add(call);
+                try (Response response = executeInterruptibly(call)) {
+                    scope.attribute("http.status_code", response.code());
+                    if (!response.isSuccessful()) {
+                        String body = response.body().string();
+                        throw new IOException(
+                                "LLM API error " + response.code()
+                                        + ", response_chars=" + body.length());
+                    }
+
+                    StreamAccumulator accumulator =
+                            new StreamAccumulator(deltaConsumer);
+                    try (BufferedReader reader =
+                                 new BufferedReader(
+                                         response.body().charStream())) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            if (Thread.currentThread().isInterrupted()) {
+                                call.cancel();
+                                throw new InterruptedIOException(
+                                        "LLM streaming cancelled");
+                            }
+                            if (line.isBlank() || line.startsWith(":")) {
+                                continue;
+                            }
+                            if (!line.startsWith("data:")) {
+                                continue;
+                            }
+                            String data = line.substring(5).stripLeading();
+                            if ("[DONE]".equals(data)) {
+                                break;
+                            }
+                            if (!data.isBlank()) {
+                                accumulator.accept(
+                                        objectMapper.readValue(
+                                                data, StreamChunk.class));
+                            }
+                        }
+                    }
+
+                    Message result = accumulator.toMessage();
+                    if (result.content == null
+                            && (result.toolCalls == null
+                            || result.toolCalls.isEmpty())) {
+                        throw new IOException(
+                                "LLM stream completed without content");
+                    }
+                    scope.attribute(
+                                    "gen_ai.finish_reason",
+                                    result.finishReason)
+                            .attribute(
+                                    "gen_ai.input_tokens",
+                                    result.inputTokens)
+                            .attribute(
+                                    "gen_ai.output_tokens",
+                                    result.outputTokens)
+                            .attribute(
+                                    "gen_ai.total_tokens",
+                                    result.totalTokens);
+                    logger.atDebug()
+                            .addKeyValue("event", "llm.chat.completed")
+                            .addKeyValue("model", model)
+                            .addKeyValue("streaming", true)
+                            .addKeyValue(
+                                    "finish_reason", result.finishReason)
+                            .addKeyValue(
+                                    "input_tokens", result.inputTokens)
+                            .addKeyValue(
+                                    "output_tokens", result.outputTokens)
+                            .addKeyValue(
+                                    "duration_ms", scope.elapsedMillis())
+                            .log("LLM 流式调用完成");
+                    return result;
+                } finally {
+                    activeCalls.remove(call);
+                }
+            } catch (IOException | RuntimeException error) {
+                scope.fail(error);
+                logger.atError()
+                        .addKeyValue("event", "llm.chat.failed")
+                        .addKeyValue("model", model)
+                        .addKeyValue("streaming", true)
+                        .addKeyValue(
+                                "error_type",
+                                error.getClass().getSimpleName())
+                        .setCause(error)
+                        .log("LLM 流式调用失败");
+                throw error;
+            }
+        }
+    }
+
+    /**
+     * Cancels every request owned by this client, including an SSE body that
+     * is currently blocked in {@link BufferedReader#readLine()}.
+     *
+     * <p>The application allows only one foreground run, so cancelling the
+     * shared client is exactly the desired scope for both a normal Agent and
+     * all parallel workers of a Plan run.</p>
+     */
+    public void cancelActiveRequests() {
+        activeCalls.forEach(Call::cancel);
+    }
+
+    /**
+     * Uses OkHttp's cancellable asynchronous call while preserving this
+     * client's synchronous API. Interrupting an Agent now cancels the socket
+     * instead of waiting for the HTTP timeout.
+     */
+    private static Response executeInterruptibly(Call call)
+            throws IOException {
+        CompletableFuture<Response> response = new CompletableFuture<>();
+        call.enqueue(new Callback() {
+            @Override
+            public void onFailure(Call ignored, IOException error) {
+                response.completeExceptionally(error);
+            }
+
+            @Override
+            public void onResponse(Call ignored, Response value) {
+                if (!response.complete(value)) {
+                    value.close();
+                }
+            }
+        });
+        try {
+            return response.get();
+        } catch (InterruptedException interrupted) {
+            call.cancel();
+            Thread.currentThread().interrupt();
+            InterruptedIOException cancelled =
+                    new InterruptedIOException("LLM request cancelled");
+            cancelled.initCause(interrupted);
+            if (!response.completeExceptionally(cancelled)) {
+                /*
+                 * The response may have won the race just before get()
+                 * observed the interrupt. No caller can receive it now.
+                 */
+                try {
+                    Response orphan = response.getNow(null);
+                    if (orphan != null) {
+                        orphan.close();
+                    }
+                } catch (RuntimeException ignored) {
+                    // The future already holds an exception; no body to close.
+                }
+            }
+            throw cancelled;
+        } catch (ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IOException(cause);
         }
     }
 
@@ -217,6 +424,10 @@ public class LlmClient {
         @JsonProperty("tools")
         public List<Map<String, Object>> tools;
 
+        @JsonProperty("stream_options")
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        public Map<String, Object> streamOptions;
+
         ChatRequest(String model, List<Message> messages, boolean stream) {
             this(model, messages, stream, null);
         }
@@ -227,6 +438,8 @@ public class LlmClient {
             this.messages = messages;
             this.stream = stream;
             this.tools = tools;
+            this.streamOptions = stream
+                    ? Map.of("include_usage", true) : null;
         }
     }
 
@@ -251,5 +464,124 @@ public class LlmClient {
         public long completionTokens;
         @JsonProperty("total_tokens")
         public long totalTokens;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    static class StreamChunk {
+        public List<StreamChoice> choices;
+        public Usage usage;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    static class StreamChoice {
+        public Delta delta;
+        @JsonProperty("finish_reason")
+        public String finishReason;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    static class Delta {
+        public String role;
+        public String content;
+        @JsonProperty("tool_calls")
+        public List<DeltaToolCall> toolCalls;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    static class DeltaToolCall {
+        public int index;
+        public String id;
+        public String type;
+        public Function function;
+    }
+
+    static final class StreamAccumulator {
+        private final Consumer<String> onTextDelta;
+        private final StringBuilder content = new StringBuilder();
+        private final Map<Integer, MutableToolCall> toolCalls =
+                new TreeMap<>();
+        private String finishReason;
+        private Usage usage;
+
+        StreamAccumulator(Consumer<String> onTextDelta) {
+            this.onTextDelta = onTextDelta;
+        }
+
+        void accept(StreamChunk chunk) {
+            if (chunk.usage != null) {
+                usage = chunk.usage;
+            }
+            if (chunk.choices == null) {
+                return;
+            }
+            for (StreamChoice choice : chunk.choices) {
+                if (choice.finishReason != null) {
+                    finishReason = choice.finishReason;
+                }
+                if (choice.delta == null) {
+                    continue;
+                }
+                if (choice.delta.content != null
+                        && !choice.delta.content.isEmpty()) {
+                    content.append(choice.delta.content);
+                    onTextDelta.accept(choice.delta.content);
+                }
+                if (choice.delta.toolCalls == null) {
+                    continue;
+                }
+                for (DeltaToolCall delta : choice.delta.toolCalls) {
+                    MutableToolCall mutable = toolCalls.computeIfAbsent(
+                            delta.index, ignored -> new MutableToolCall());
+                    if (delta.id != null) {
+                        mutable.id.append(delta.id);
+                    }
+                    if (delta.type != null) {
+                        mutable.type = delta.type;
+                    }
+                    if (delta.function != null) {
+                        if (delta.function.name != null) {
+                            mutable.name.append(delta.function.name);
+                        }
+                        if (delta.function.arguments != null) {
+                            mutable.arguments.append(
+                                    delta.function.arguments);
+                        }
+                    }
+                }
+            }
+        }
+
+        Message toMessage() {
+            Message message = new Message(
+                    "assistant",
+                    content.isEmpty() ? null : content.toString());
+            if (!toolCalls.isEmpty()) {
+                List<ToolCall> completed = new ArrayList<>();
+                toolCalls.values().forEach(mutable -> {
+                    ToolCall call = new ToolCall();
+                    call.id = mutable.id.toString();
+                    call.type = mutable.type;
+                    call.function = new Function();
+                    call.function.name = mutable.name.toString();
+                    call.function.arguments = mutable.arguments.toString();
+                    completed.add(call);
+                });
+                message.toolCalls = completed;
+            }
+            message.finishReason = finishReason;
+            if (usage != null) {
+                message.inputTokens = usage.promptTokens;
+                message.outputTokens = usage.completionTokens;
+                message.totalTokens = usage.totalTokens;
+            }
+            return message;
+        }
+    }
+
+    private static final class MutableToolCall {
+        private final StringBuilder id = new StringBuilder();
+        private String type = "function";
+        private final StringBuilder name = new StringBuilder();
+        private final StringBuilder arguments = new StringBuilder();
     }
 }

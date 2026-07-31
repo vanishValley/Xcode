@@ -86,15 +86,30 @@ public class WebSearchTool implements Tool {
                 .build();
 
         String respBody;
-        try (Response response = httpClient.newCall(request).execute()) {
-            if (!response.isSuccessful()) {
+        try {
+            SearchResponse response = InterruptibleHttp.execute(
+                    httpClient.newCall(request),
+                    raw -> {
+                        var bodyResponse = raw.body();
+                        String bodyText = raw.isSuccessful()
+                                && bodyResponse != null
+                                ? bodyResponse.string() : null;
+                        return new SearchResponse(
+                                raw.code(), raw.isSuccessful(), bodyText);
+                    });
+            if (!response.successful()) {
                 return error("HTTP_" + response.code(),
                         "搜索服务请求失败");
             }
-            var resp = response.body();
-            if (resp == null) return error("EMPTY_RESPONSE", "搜索服务响应为空");
-            respBody = resp.string();
+            if (response.body() == null) {
+                return error("EMPTY_RESPONSE", "搜索服务响应为空");
+            }
+            respBody = response.body();
         } catch (IOException e) {
+            if (e instanceof java.io.InterruptedIOException
+                    || Thread.currentThread().isInterrupted()) {
+                throw e;
+            }
             return error("NETWORK_ERROR", safeMessage(e));
         }
 
@@ -156,6 +171,12 @@ public class WebSearchTool implements Tool {
                 "选择可信且相关的 URL，使用 web_fetch 获取正文；"
                         + "如 web_fetch 返回 browser_required，则改用 Chrome DevTools MCP。");
         return mapper.writeValueAsString(output);
+    }
+
+    private record SearchResponse(
+            int code,
+            boolean successful,
+            String body) {
     }
 
     private String error(String code, String message) {

@@ -1,8 +1,6 @@
-package com.xu.memory;
+package com.xu.plan;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.xu.plan.ExecutionPlan;
-import com.xu.plan.Task;
 import com.xu.util.FileUtils;
 
 import org.slf4j.Logger;
@@ -41,6 +39,8 @@ public class PlanStore {
     private static final int SCHEMA_VERSION = 1;
 
     private static final String FILE_NAME = "plan_checkpoint.json";
+    public static final String INTERRUPTED_RESULT_PREFIX =
+            "[INTERRUPTED] ";
 
     private final Path checkpointFile;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -66,10 +66,10 @@ public class PlanStore {
 
     /**
      * 保存 checkpoint（全量原子重写）。
-     * best-effort：失败只记录日志、不抛出，绝不因为 checkpoint 写失败中断 plan
-     * 执行——丢的只是"可恢复性"，不是任务本身。
+     * 失败只记录日志、不抛出，并通过返回值交给调用方决定策略。变更型 Worker
+     * 启动前必须检查该返回值并 fail closed；终态更新则可以尽力保存。
      */
-    public void save(Checkpoint cp) {
+    public boolean save(Checkpoint cp) {
         try {
             Map<String, Object> root = new LinkedHashMap<>();
             root.put("version", SCHEMA_VERSION);
@@ -90,8 +90,10 @@ public class PlanStore {
 
             String json = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(root);
             FileUtils.atomicWrite(checkpointFile, json);
+            return true;
         } catch (IOException e) {
-            logger.error("checkpoint 保存失败(不影响执行): {}", e.getMessage());
+            logger.error("checkpoint 保存失败: {}", e.getMessage());
+            return false;
         }
     }
 
@@ -119,32 +121,54 @@ public class PlanStore {
                 List<String> deps = (List<String>) m.getOrDefault("dependencies", List.of());
 
                 Task t = new Task(id, description, deps);
-                t.setStatus(parseStatus(m.get("status")));
-                t.setResult(m.get("result") != null ? String.valueOf(m.get("result")) : "");
+                Task.Status status = parseStatus(m.get("status"));
+                String result = m.get("result") != null
+                        ? String.valueOf(m.get("result")) : "";
+                if (status == null) {
+                    status = Task.Status.FAILED;
+                    result = INTERRUPTED_RESULT_PREFIX
+                            + "检查点中的任务状态无法识别；"
+                            + "为避免重复副作用，未自动重试。";
+                } else if (status == Task.Status.IN_PROGRESS) {
+                    /*
+                     * The process died after this task was durably marked as
+                     * started. Its side effects are unknown, so silently
+                     * replaying it would be unsafe.
+                     */
+                    status = Task.Status.FAILED;
+                    result = INTERRUPTED_RESULT_PREFIX
+                            + "上次运行在此步骤中断，未自动重试。";
+                }
+                t.setStatus(status);
+                t.setResult(result);
                 plan.addTask(t);
             }
             return new Checkpoint(userRequest, replanCount, plan);
         } catch (Exception e) {
-            logger.error("checkpoint 损坏, 忽略: {}", e.getMessage());
+            logger.error(
+                    "checkpoint 损坏, 忽略: {}",
+                    e.getClass().getSimpleName());
             return null;
         }
     }
 
-    /**
-     * 解析 status，并把 IN_PROGRESS 一律重置为 PENDING。
-     *
-     * 为什么重置？崩溃时正在执行的 task 若被存成 IN_PROGRESS，恢复后既不是
-     * COMPLETED 也不是 PENDING → getReadyTasks 挑不到它 → 卡死。重置成 PENDING
-     * 让它当就绪任务重跑。（正常流程只在终态落盘、不会出现 IN_PROGRESS，
-     * 这是防手改文件 / 未来改动的保险。）
-     */
+    /** Parses a persisted status; null means unknown and must fail closed. */
     private Task.Status parseStatus(Object raw) {
         try {
-            Task.Status s = Task.Status.valueOf(String.valueOf(raw));
-            return s == Task.Status.IN_PROGRESS ? Task.Status.PENDING : s;
+            return Task.Status.valueOf(String.valueOf(raw));
         } catch (Exception e) {
-            return Task.Status.PENDING;   // 无法识别的状态一律当待执行
+            return null;
         }
+    }
+
+    public boolean hasInterruptedTasks(Checkpoint checkpoint) {
+        return checkpoint != null
+                && checkpoint.plan().getAllTasks().stream()
+                        .anyMatch(task ->
+                                task.getStatus() == Task.Status.FAILED
+                                && task.getResult() != null
+                                && task.getResult().startsWith(
+                                        INTERRUPTED_RESULT_PREFIX));
     }
 
     // ────── 删 / 查 ──────

@@ -5,7 +5,9 @@ import com.xu.tool.ToolExecutionResult;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -130,7 +132,7 @@ public class ExecuteCommandTool implements Tool {
             try (BufferedReader reader = new BufferedReader(
                     new InputStreamReader(
                             process.getInputStream(),
-                            StandardCharsets.UTF_8))) {
+                            commandCharset(isWindows)))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     appendWithinLimit(output, line, truncated);
@@ -148,12 +150,12 @@ public class ExecuteCommandTool implements Tool {
             timedOut = !process.waitFor(
                     TIMEOUT_SECONDS, TimeUnit.SECONDS);
             if (timedOut) {
-                process.destroyForcibly();
+                destroyProcessTree(process);
                 process.waitFor(5, TimeUnit.SECONDS);
             }
             outputReader.join(5_000);
         } catch (InterruptedException error) {
-            process.destroyForcibly();
+            destroyProcessTree(process);
             outputReader.interrupt();
             Thread.currentThread().interrupt();
             throw error;
@@ -191,6 +193,43 @@ public class ExecuteCommandTool implements Tool {
         }
         return ToolExecutionResult.command(
                 result.toString(), exitCode, timedOut);
+    }
+
+    /**
+     * Takes a descendant snapshot before killing the shell. On Windows,
+     * terminating only {@code cmd /c} can leave Maven, Java or Node children
+     * running after the user presses Ctrl+C.
+     */
+    private static void destroyProcessTree(Process process) {
+        List<ProcessHandle> descendants =
+                process.descendants().toList();
+        descendants.forEach(handle -> {
+            if (handle.isAlive()) {
+                handle.destroy();
+            }
+        });
+        process.destroy();
+        descendants.forEach(handle -> {
+            if (handle.isAlive()) {
+                handle.destroyForcibly();
+            }
+        });
+        if (process.isAlive()) {
+            process.destroyForcibly();
+        }
+    }
+
+    private static Charset commandCharset(boolean windows) {
+        String configured = System.getenv("XCODE_COMMAND_CHARSET");
+        if (configured != null && !configured.isBlank()) {
+            try {
+                return Charset.forName(configured.strip());
+            } catch (RuntimeException ignored) {
+                // Fall back to the platform-safe default below.
+            }
+        }
+        return windows ? Charset.defaultCharset()
+                : StandardCharsets.UTF_8;
     }
 
     /** 持续排空进程输出，但只保留前 MAX_OUTPUT_CHARS 个字符。 */

@@ -11,7 +11,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
 /**
- * 统一管理 Xcode 所有路径 —— 替代原来散落在 SessionStore / KnowledgeStore / PlanStore / Main
+ * 统一管理 Xcode 所有路径 —— 替代原来散落在 SessionStore / LongTermMemory / PlanStore / Main
  * 四处的路径计算逻辑。
  *
  * 两层目录:

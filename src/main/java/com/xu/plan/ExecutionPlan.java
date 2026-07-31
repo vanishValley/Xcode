@@ -2,6 +2,7 @@ package com.xu.plan;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 /**
@@ -16,16 +17,27 @@ import java.util.stream.Collectors;
  */
 public class ExecutionPlan {
 
-    private final Map<String, Task> tasks = new ConcurrentHashMap<>();  // 保持插入顺序
+    private final Map<String, Task> tasks = new ConcurrentHashMap<>();
+    private final List<String> taskOrder = new CopyOnWriteArrayList<>();
 
     /** 添加一个 Task */
     public void addTask(Task task) {
+        if (!tasks.containsKey(task.getId())) {
+            taskOrder.add(task.getId());
+        }
         tasks.put(task.getId(), task);
     }
 
     /** 获取所有 Task（按添加顺序） */
     public List<Task> getAllTasks() {
-        return new ArrayList<>(tasks.values());
+        List<Task> ordered = new ArrayList<>(taskOrder.size());
+        for (String id : taskOrder) {
+            Task task = tasks.get(id);
+            if (task != null) {
+                ordered.add(task);
+            }
+        }
+        return ordered;
     }
 
     /** 按 id 获取单个 Task */
@@ -48,7 +60,7 @@ public class ExecutionPlan {
      */
     public List<Task> getReadyTasks() {
         List<Task> ready = new ArrayList<>();
-        for (Task t : tasks.values()) {
+        for (Task t : getAllTasks()) {
             if (t.getStatus() != Task.Status.PENDING) continue;
 
             boolean allDepsDone = true;
@@ -78,52 +90,53 @@ public class ExecutionPlan {
 
     /** 所有 Task 是否都处于终态（COMPLETED 或 FAILED） */
     public boolean isAllComplete() {
-        return tasks.values().stream()
+        return getAllTasks().stream()
                 .allMatch(t -> t.getStatus() == Task.Status.COMPLETED
                             || t.getStatus() == Task.Status.FAILED);
     }
 
     /** 所有 Task 是否都已成功完成 */
     public boolean isAllSuccess() {
-        return tasks.values().stream()
+        return getAllTasks().stream()
                 .allMatch(t -> t.getStatus() == Task.Status.COMPLETED);
     }
 
     /** 获取所有失败的 Task */
     public List<Task> getFailedTasks() {
-        return tasks.values().stream()
+        return getAllTasks().stream()
                 .filter(t -> t.getStatus() == Task.Status.FAILED)
                 .collect(Collectors.toList());
     }
 
     /** 获取所有已完成的 Task */
     public List<Task> getCompletedTasks() {
-        return tasks.values().stream()
+        return getAllTasks().stream()
                 .filter(t -> t.getStatus() == Task.Status.COMPLETED)
                 .collect(Collectors.toList());
     }
 
     /** 获取所有 PENDING 的 Task */
     public List<Task> getPendingTasks() {
-        return tasks.values().stream()
+        return getAllTasks().stream()
                 .filter(t -> t.getStatus() == Task.Status.PENDING)
                 .collect(Collectors.toList());
     }
 
     /** 移除所有 PENDING 状态的 Task（重规划前清理） */
     public void removePendingTasks() {
-        tasks.values().removeIf(t -> t.getStatus() == Task.Status.PENDING);
+        getPendingTasks().forEach(task -> removeTask(task.getId()));
     }
 
     /** 移除指定 Task */
     public void removeTask(String id) {
         tasks.remove(id);
+        taskOrder.remove(id);
     }
 
     /** 获取下一个可用的重规划 task id（如 task_r0） */
     public int nextReplanIndex() {
         int max = 0;
-        for (String id : tasks.keySet()) {
+        for (String id : taskOrder) {
             // 从原版 task_N 和重规划版 task_rN 中找最大序号
             String numStr = id.replace("task_", "").replace("r", "");
             try {
@@ -200,7 +213,7 @@ public class ExecutionPlan {
         Set<String> visited = new HashSet<>();
         Set<String> recStack = new HashSet<>();
 
-        for (String id : tasks.keySet()) {
+        for (String id : taskOrder) {
             if (hasCycleFrom(id, visited, recStack)) {
                 return true;
             }
@@ -242,7 +255,7 @@ public class ExecutionPlan {
      */
     public Map<String, String> getBlockedTasks() {
         Map<String, String> blocked = new LinkedHashMap<>();
-        for (Task t : tasks.values()) {
+        for (Task t : getAllTasks()) {
             if (t.getStatus() != Task.Status.PENDING) continue;
             List<String> unmet = new ArrayList<>();
             for (String depId : t.getDependencies()) {
@@ -264,11 +277,9 @@ public class ExecutionPlan {
     public String summary() {
         StringBuilder sb = new StringBuilder();
         sb.append("执行计划（共 ").append(tasks.size()).append(" 个步骤）：\n");
-        List<Task> sorted = tasks.values().stream()
-                .sorted(Comparator.comparing(Task::getId))
-                .toList();
+        List<Task> ordered = getAllTasks();
         int i = 1;
-        for (Task t : sorted) {
+        for (Task t : ordered) {
             String deps = t.getDependencies().isEmpty()
                     ? "无"
                     : String.join(", ", t.getDependencies());
@@ -281,8 +292,7 @@ public class ExecutionPlan {
     public String buildReport(){
         StringBuilder sb = new StringBuilder();
         sb.append("执行计划汇总（共 ").append(tasks.size()).append(" 个步骤）：\n");
-        tasks.values().stream()
-                .sorted(Comparator.comparing(Task::getId))
+        getAllTasks().stream()
                 .forEach(t -> {
                     String icon = switch (t.getStatus()) {
                         case COMPLETED -> "[OK]";

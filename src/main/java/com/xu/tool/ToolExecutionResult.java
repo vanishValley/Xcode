@@ -58,4 +58,38 @@ public record ToolExecutionResult(
         return new ToolExecutionResult(
                 true, content, null, exitCode, false);
     }
+
+    /**
+     * Compatibility adapter for legacy String-returning tools.
+     *
+     * <p>New tools should override {@code executeObserved}; this adapter keeps
+     * old built-ins from painting obvious failures green in the TUI.</p>
+     */
+    public static ToolExecutionResult fromLegacyText(String content) {
+        String value = content == null ? "" : content;
+        String stripped = value.stripLeading();
+        boolean failure =
+                stripped.startsWith("错误:")
+                        || stripped.startsWith("错误：")
+                        || stripped.startsWith("文件不存在")
+                        || stripped.startsWith("文件过大")
+                        || stripped.startsWith("读取失败")
+                        || stripped.startsWith("写入失败")
+                        || stripped.startsWith("目录不存在")
+                        || stripped.startsWith("路径不是目录")
+                        || stripped.startsWith("Skill '")
+                        && (stripped.contains("不存在")
+                        || stripped.contains("已被禁用"))
+                        || stripped.startsWith("MCP_TOOL_ERROR")
+                        || hasJsonStatus(stripped, "error")
+                        || hasJsonStatus(stripped, "blocked");
+        return failure
+                ? failure(value, "TOOL_REPORTED_FAILURE")
+                : success(value);
+    }
+
+    private static boolean hasJsonStatus(String value, String status) {
+        return value.matches(
+                "(?s).*\"status\"\\s*:\\s*\"" + status + "\".*");
+    }
 }

@@ -10,10 +10,13 @@ import com.xu.tool.ToolRegistry;
 import com.xu.tool.impl.GlobFilesTool;
 import com.xu.tool.impl.ListDirTool;
 import com.xu.tool.impl.ReadFileTool;
+import com.xu.ui.UiEventSink;
+import com.xu.util.CancellationToken;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,20 +57,35 @@ public class Reviewer {
     private final ToolRegistry toolRegistry;
     private final ToolExecutor toolExecutor;
     private final Tracing tracing;
+    private final CancellationToken cancellation;
 
     public Reviewer(LlmClient llmClient) {
         this(llmClient, Tracing.noop());
     }
 
     public Reviewer(LlmClient llmClient, Tracing tracing) {
+        this(llmClient, tracing, new CancellationToken());
+    }
+
+    public Reviewer(
+            LlmClient llmClient,
+            Tracing tracing,
+            CancellationToken cancellation) {
         this.llmClient = llmClient;
         this.tracing = tracing;
+        this.cancellation = cancellation == null
+                ? new CancellationToken() : cancellation;
         // 只注册只读工具
         this.toolRegistry = new ToolRegistry();
         this.toolRegistry.register(new ReadFileTool());
         this.toolRegistry.register(new ListDirTool());
         this.toolRegistry.register(new GlobFilesTool());
-        this.toolExecutor = new ToolExecutor(toolRegistry, tracing);
+        this.toolExecutor = new ToolExecutor(
+                toolRegistry,
+                tracing,
+                UiEventSink.noop(),
+                "review",
+                this.cancellation);
     }
 
     /**
@@ -96,6 +114,7 @@ public class Reviewer {
 
             // 轻量 ReAct 循环
             for (int turn = 0; turn < MAX_REVIEW_TURNS; turn++) {
+                ensureActive();
                 List<Map<String, Object>> tools = toolRegistry.isEmpty()
                         ? null : toolRegistry.toOpenAiTools();
 
@@ -103,11 +122,16 @@ public class Reviewer {
                 try {
                     reply = llmClient.chatRaw(history, tools);
                 } catch (Exception e) {
+                    if (isCancellation(e)) {
+                        Thread.currentThread().interrupt();
+                        throw new CancellationException(
+                                "Review cancelled");
+                    }
                     // LLM 调用失败 → 宽容放行
                     reviewScope.event("review.llm_failure_tolerated");
                     reviewScope.attribute("review.outcome", "TOLERATED");
                     logger.warn("LLM 调用失败, 宽容放行: {}",
-                            e.getMessage());
+                            e.getClass().getSimpleName());
                     return new ReviewResult(true,
                             List.of("审查者 LLM 调用异常,已自动放行"),
                             List.of());
@@ -127,16 +151,17 @@ public class Reviewer {
                                             ? "APPROVED"
                                             : "REJECTED");
                     logger.debug(
-                            "审查结果: approved={}, issues={}, suggestions={}",
+                            "审查结果: approved={}, issue_count={}, suggestion_count={}",
                             result.approved(),
-                            result.issues(),
-                            result.suggestions());
+                            result.issues().size(),
+                            result.suggestions().size());
                     return result;
                 }
 
                 // 有工具调用 → 执行并回灌
                 history.add(reply);
                 for (LlmClient.ToolCall tc : reply.toolCalls) {
+                    ensureActive();
                     ToolExecutionResult execution = toolExecutor.execute(tc);
                     Message toolMsg =
                             new Message("tool", execution.content());
@@ -160,5 +185,20 @@ public class Reviewer {
                     .attribute("review.outcome", "MAX_TURNS_FALLBACK");
             return fallback;
         }
+    }
+
+    private void ensureActive() {
+        if (cancellation.isCancelled()
+                || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("Review cancelled");
+        }
+    }
+
+    private boolean isCancellation(Throwable error) {
+        return cancellation.isCancelled()
+                || error instanceof InterruptedException
+                || error instanceof java.io.InterruptedIOException
+                || error instanceof CancellationException
+                || Thread.currentThread().isInterrupted();
     }
 }

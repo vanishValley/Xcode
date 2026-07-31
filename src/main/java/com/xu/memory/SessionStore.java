@@ -74,7 +74,7 @@ public class SessionStore {
                 messages.add(msg);
             } catch (Exception e) {
                 // 单行损坏不阻塞整体恢复——记录日志后跳过
-                logger.warn("跳过损坏的行: {}", line.substring(0, Math.min(80, line.length())));
+                logger.warn("跳过损坏的会话行: chars={}", line.length());
             }
         }
         return messages;

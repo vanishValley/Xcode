@@ -1,7 +1,5 @@
-package com.xu.memory;
+package com.xu.plan;
 
-import com.xu.plan.ExecutionPlan;
-import com.xu.plan.Task;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -62,7 +60,7 @@ class PlanStoreTest {
     }
 
     @Test
-    void inProgressShouldBeResetToPendingOnLoad() {
+    void inProgressShouldBecomeNonReplayableInterruptedFailureOnLoad() {
         ExecutionPlan plan = new ExecutionPlan();
         Task t = new Task("task_0", "跑一半崩了", List.of());
         t.setStatus(Task.Status.IN_PROGRESS);
@@ -70,7 +68,11 @@ class PlanStoreTest {
         store.save(new PlanStore.Checkpoint("x", 0, plan));
 
         PlanStore.Checkpoint cp = store.load();
-        assertEquals(Task.Status.PENDING, cp.plan().getTask("task_0").getStatus());
+        Task restored = cp.plan().getTask("task_0");
+        assertEquals(Task.Status.FAILED, restored.getStatus());
+        assertTrue(restored.getResult().startsWith(
+                PlanStore.INTERRUPTED_RESULT_PREFIX));
+        assertTrue(store.hasInterruptedTasks(cp));
     }
 
     @Test
@@ -96,5 +98,33 @@ class PlanStoreTest {
         List<Task> ready = cp.plan().getReadyTasks();
         assertEquals(1, ready.size());
         assertEquals("task_1", ready.get(0).getId());
+    }
+
+    @Test
+    void unknownPersistedStatusShouldFailClosedInsteadOfReplaying()
+            throws Exception {
+        Files.writeString(
+                tempDir.resolve("plan_checkpoint.json"),
+                """
+                        {
+                          "version": 1,
+                          "userRequest": "x",
+                          "replanCount": 0,
+                          "tasks": [{
+                            "id": "task_0",
+                            "description": "unknown state",
+                            "dependencies": [],
+                            "status": "FUTURE_STATUS",
+                            "result": ""
+                          }]
+                        }
+                        """);
+
+        PlanStore.Checkpoint checkpoint = store.load();
+        assertNotNull(checkpoint);
+        Task task = checkpoint.plan().getTask("task_0");
+        assertEquals(Task.Status.FAILED, task.getStatus());
+        assertTrue(store.hasInterruptedTasks(checkpoint));
+        assertTrue(checkpoint.plan().getReadyTasks().isEmpty());
     }
 }

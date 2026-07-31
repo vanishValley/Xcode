@@ -4,6 +4,7 @@ import com.xu.llm.LlmClient;
 import com.xu.llm.LlmClient.Message;
 import com.xu.llm.LlmClient.ToolCall;
 import com.xu.memory.MemoryManager;
+import com.xu.hitl.ApprovalPolicy;
 import com.xu.observability.MdcScope;
 import com.xu.observability.TraceScope;
 import com.xu.observability.Tracing;
@@ -11,10 +12,16 @@ import com.xu.skill.SkillRegistry;
 import com.xu.tool.ToolExecutionResult;
 import com.xu.tool.ToolExecutor;
 import com.xu.tool.ToolRegistry;
+import com.xu.ui.UiEvent;
+import com.xu.ui.UiEventSink;
+import com.xu.util.CancellationToken;
+import com.xu.ui.SafeDisplay;
+import com.xu.ui.StreamingDisplaySanitizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -23,11 +30,12 @@ import java.util.Set;
  * ReAct Agent —— "思考 (Think) → 行动 (Act) → 观察 (Observe)" 循环。
  *
  * 每轮 run() 的流程:
- *   1. 检索相关长期记忆 → 注入上下文
+ *   1. 为本次任务冻结相关长期记忆和工具定义
  *   2. 检查 Token 是否超限 → 触发对话压缩
- *   3. 发送 [system + 历史 + tools] 给 LLM
- *   4. LLM 返回 content → 保存会话，结束
- *   5. LLM 返回 tool_calls → 执行工具 → 结果回灌 → 回到第 2 步
+ *   3. 按 [system + 目标 + 记忆 + Plan上下文 + 历史] 组装 messages
+ *   4. 连同固定 tools 发送给 LLM
+ *   5. LLM 返回 content → 保存会话，结束
+ *   6. LLM 返回 tool_calls → 执行工具 → 结果回灌 → 回到第 2 步
  *
  * Memory 全部通过 MemoryManager 门面操作，Agent 不直连各组件。
  */
@@ -65,6 +73,8 @@ public class Agent {
     private final ToolRegistry toolRegistry;
     private final ToolExecutor toolExecutor;
     private final Tracing tracing;
+    private final UiEventSink events;
+    private final CancellationToken cancellation;
 
     /** Memory 系统门面（子 Agent 为 null） */
     private final MemoryManager memory;
@@ -85,7 +95,7 @@ public class Agent {
                  com.xu.skill.SkillRegistry skillRegistry,
                  String taskLabel) {
         this(llmClient, toolRegistry, memory, skillRegistry,
-                taskLabel, Tracing.noop());
+                taskLabel, Tracing.noop(), UiEventSink.noop());
     }
 
     public Agent(LlmClient llmClient, ToolRegistry toolRegistry,
@@ -93,10 +103,46 @@ public class Agent {
                  com.xu.skill.SkillRegistry skillRegistry,
                  String taskLabel,
                  Tracing tracing) {
+        this(llmClient, toolRegistry, memory, skillRegistry,
+                taskLabel, tracing, UiEventSink.noop());
+    }
+
+    public Agent(LlmClient llmClient, ToolRegistry toolRegistry,
+                 MemoryManager memory,
+                 com.xu.skill.SkillRegistry skillRegistry,
+                 String taskLabel,
+                 Tracing tracing,
+                 UiEventSink events) {
+        this(
+                llmClient,
+                toolRegistry,
+                memory,
+                skillRegistry,
+                taskLabel,
+                tracing,
+                events,
+                new CancellationToken());
+    }
+
+    public Agent(LlmClient llmClient, ToolRegistry toolRegistry,
+                 MemoryManager memory,
+                 com.xu.skill.SkillRegistry skillRegistry,
+                 String taskLabel,
+                 Tracing tracing,
+                 UiEventSink events,
+                 CancellationToken cancellation) {
         this.llmClient = llmClient;
         this.toolRegistry = toolRegistry;
         this.tracing = tracing;
-        this.toolExecutor = new ToolExecutor(toolRegistry, tracing);
+        this.events = events == null ? UiEventSink.noop() : events;
+        this.cancellation = cancellation == null
+                ? new CancellationToken() : cancellation;
+        this.toolExecutor = new ToolExecutor(
+                toolRegistry,
+                tracing,
+                this.events,
+                taskLabel,
+                this.cancellation);
         this.memory = memory;
         this.skillRegistry = skillRegistry;
         this.history = new ArrayList<>();
@@ -115,7 +161,10 @@ public class Agent {
             } else {
                 history.add(0, new Message("system", buildSystemPrompt()));
             }
-            System.out.println("[已恢复上次会话: " + saved.size() + " 条消息]");
+            this.events.emit(new UiEvent.SessionChanged(
+                    UiEvent.SessionAction.RESTORED,
+                    saved.size(),
+                    "已恢复上次会话"));
             return;
         }
         // 空白启动
@@ -133,6 +182,13 @@ public class Agent {
                  Tracing tracing) {
         this(llmClient, toolRegistry, memory, skillRegistry,
                 "main", tracing);
+    }
+
+    public Agent(LlmClient llmClient, ToolRegistry toolRegistry,
+                 MemoryManager memory, SkillRegistry skillRegistry,
+                 Tracing tracing, UiEventSink events) {
+        this(llmClient, toolRegistry, memory, skillRegistry,
+                "main", tracing, events);
     }
 
     //子Agent
@@ -156,8 +212,31 @@ public class Agent {
             int llmCalls,
             int toolCalls,
             int recoveredErrors,
+            boolean mutatingToolUsed,
             long inputTokens,
             long outputTokens) {
+    }
+
+    /**
+     * Signals that a run failed after at least one tool may have changed
+     * external state. Callers must not treat this as an ordinary retryable
+     * failure.
+     */
+    public static final class PartialExecutionException extends Exception {
+        private final boolean cancelled;
+
+        private PartialExecutionException(
+                Throwable cause,
+                boolean cancelled) {
+            super(
+                    "任务在工具执行后中断；部分外部副作用可能已发生",
+                    cause);
+            this.cancelled = cancelled;
+        }
+
+        public boolean cancelled() {
+            return cancelled;
+        }
     }
 
     /** 清空历史 + 删除会话文件 */
@@ -168,7 +247,8 @@ public class Agent {
             memory.deleteSession();
             memory.resetCompactor();
         }
-        System.out.println("[历史已清空]");
+        events.emit(new UiEvent.SessionChanged(
+                UiEvent.SessionAction.CLEARED, 0, "历史已清空"));
     }
 
     /** 注入外部上下文(Plan 模式执行报告等) —— 走 MemoryManager.setContext,不污染干净历史。 */
@@ -178,7 +258,10 @@ public class Agent {
         } else {
             history.add(new Message("system", contextMessage));  // 子 Agent 无 MemoryManager,走历史
         }
-        System.out.println("[上下文已注入]");
+        events.emit(new UiEvent.SessionChanged(
+                UiEvent.SessionAction.CONTEXT_INJECTED,
+                history.size(),
+                "上下文已注入"));
     }
 
     // ────── ReAct 循环 ──────
@@ -198,13 +281,25 @@ public class Agent {
      * 执行任务并返回文本与运行统计，供 Plan 子任务生成汇总日志。
      */
     RunResult runDetailed(String userInput) throws Exception {
+        long startedAt = System.nanoTime();
+        List<Message> historyBeforeRun = new ArrayList<>(history);
         int llmCalls = 0;
         int toolCalls = 0;
         int recoveredErrors = 0;
+        boolean mutatingToolUsed = false;
         int turns = 0;
         long inputTokens = 0;
         long outputTokens = 0;
         Message finalReply = null;
+        Message pendingToolReply = null;
+        boolean streamedFinal = false;
+
+        events.emit(new UiEvent.AgentChanged(
+                taskLabel,
+                UiEvent.AgentPhase.STARTED,
+                0,
+                0,
+                "开始处理"));
 
         // try-with-resources 保证正常返回或异常退出时都会结束根 Span。
         // attribute() 返回当前 TraceScope，因此可以连续链式调用。
@@ -221,9 +316,19 @@ public class Agent {
             try {
                 // 1. 追加用户消息到干净历史(注入块在 assemblePrompt 里临时拼,不进历史)
                 history.add(new Message("user", userInput));
+                if (memory != null) {
+                    memory.beginTask(userInput);
+                }
+
+                // 工具定义在同一次 ReAct 任务内固定，所有模型调用复用同一份。
+                List<Map<String, Object>> tools =
+                        toolRegistry.isEmpty()
+                                ? null
+                                : toolRegistry.toOpenAiTools();
 
                 // 2. ReAct 循环
                 for (int turn = 0; turn < MAX_TURNS; turn++) {
+                    cancellation.throwIfCancellationRequested();
                     turns = turn + 1;
                     // start() 会自动继承当前 agent.run，形成父子 Span。
                     try (TraceScope turnScope = tracing.start("agent.turn")
@@ -269,13 +374,45 @@ public class Agent {
                                 .addKeyValue(
                                         "estimated_context_percent", usage)
                                 .log("开始 Agent 轮次");
+                        events.emit(new UiEvent.AgentChanged(
+                                taskLabel,
+                                UiEvent.AgentPhase.TURN_STARTED,
+                                turn + 1,
+                                usage,
+                                "准备模型请求"));
 
                         // 2c. 发请求
-                        List<Map<String, Object>> tools =
-                                toolRegistry.isEmpty()
-                                        ? null
-                                        : toolRegistry.toOpenAiTools();
-                        Message reply = llmClient.chatRaw(prompt, tools);
+                        events.emit(new UiEvent.AgentChanged(
+                                taskLabel,
+                                UiEvent.AgentPhase.WAITING_FOR_MODEL,
+                                turn + 1,
+                                usage,
+                                "等待模型"));
+                        boolean streamThisCall =
+                                "main".equals(taskLabel)
+                                        && events.supportsStreaming();
+                        StreamingDisplaySanitizer streamDisplay =
+                                streamThisCall
+                                        ? new StreamingDisplaySanitizer(
+                                                delta -> events.emit(
+                                                        new UiEvent.AssistantDelta(
+                                                                taskLabel,
+                                                                delta)))
+                                        : null;
+                        Message reply;
+                        try {
+                            reply = streamThisCall
+                                    ? llmClient.chatRawStreaming(
+                                            prompt,
+                                            tools,
+                                            streamDisplay::accept)
+                                    : llmClient.chatRaw(prompt, tools);
+                        } finally {
+                            if (streamDisplay != null) {
+                                streamDisplay.flush();
+                            }
+                        }
+                        cancellation.throwIfCancellationRequested();
                         llmCalls++;
                         inputTokens += reply.inputTokens;
                         outputTokens += reply.outputTokens;
@@ -293,10 +430,12 @@ public class Agent {
                                                     ? 0L
                                                     : reply.content.length());
                             finalReply = reply;
+                            streamedFinal = streamThisCall;
                             break;
                         }
 
                         // 工具调用
+                        pendingToolReply = reply;
                         turnScope.attribute(
                                         "agent.turn.next_action", "TOOL_CALL")
                                 .attribute(
@@ -305,9 +444,13 @@ public class Agent {
                         history.add(reply);
 
                         for (ToolCall tc : reply.toolCalls) {
+                            cancellation.throwIfCancellationRequested();
                             ToolExecutionResult execution =
                                     toolExecutor.execute(tc);
                             toolCalls++;
+                            if (mayHaveMutated(tc, execution)) {
+                                mutatingToolUsed = true;
+                            }
                             if (!execution.success()) {
                                 recoveredErrors++;
                             }
@@ -317,6 +460,7 @@ public class Agent {
                             toolMsg.toolCallId = tc.id;
                             history.add(toolMsg);
                         }
+                        pendingToolReply = null;
                     }
 
                     if (finalReply != null) {
@@ -352,15 +496,21 @@ public class Agent {
                             .addKeyValue(
                                     "duration_ms", runScope.elapsedMillis())
                             .log("Agent 任务执行完成");
-                    return new RunResult(
+                    RunResult result = new RunResult(
                             finalReply.content,
                             "SUCCESS",
                             turns,
                             llmCalls,
                             toolCalls,
                             recoveredErrors,
+                            mutatingToolUsed,
                             inputTokens,
                             outputTokens);
+                    emitCompleted(
+                            result,
+                            startedAt,
+                            streamedFinal);
+                    return result;
                 }
 
                 // 兜底: 超过最大轮数
@@ -389,7 +539,7 @@ public class Agent {
                     memory.persist(history);
                     memory.tryAutoExtract(history, llmClient);
                 }
-                return new RunResult(
+                RunResult degraded = new RunResult(
                         "已执行 " + MAX_TURNS
                                 + " 轮工具调用仍未完成任务，请简化需求或补充说明。",
                         "DEGRADED",
@@ -397,11 +547,48 @@ public class Agent {
                         llmCalls,
                         toolCalls,
                         recoveredErrors,
+                        mutatingToolUsed,
                         inputTokens,
                         outputTokens);
+                emitCompleted(degraded, startedAt, false);
+                return degraded;
             } catch (Exception error) {
+                /*
+                 * Once a tool has started, its external side effects cannot
+                 * be rolled back with the transcript. Preserve that coherent
+                 * evidence and fill any unanswered calls with an explicit
+                 * unknown-state result. Only a run that never reached a tool
+                 * is safe to restore wholesale.
+                 */
+                boolean partialToolEffects =
+                        toolCalls > 0 || pendingToolReply != null;
+                if (partialToolEffects) {
+                    completeInterruptedToolBatch(pendingToolReply);
+                    history.add(new Message(
+                            "system",
+                            "【本地恢复标记】上一轮在工具执行后中断。"
+                                    + "部分外部副作用可能已经发生；"
+                                    + "继续前请先检查工作区，不要盲目重复执行。"));
+                    if (memory != null) {
+                        memory.persist(history);
+                    }
+                } else {
+                    history.clear();
+                    history.addAll(historyBeforeRun);
+                    if (memory != null) {
+                        /*
+                         * Compaction mutates its own turn counter in addition
+                         * to rewriting history. A full rollback must reset the
+                         * companion state as well.
+                         */
+                        memory.resetCompactor();
+                    }
+                }
                 runScope.fail(error);
                 runScope.attribute("agent.outcome", "FAILED")
+                        .attribute(
+                                "agent.partial_tool_effects",
+                                partialToolEffects)
                         .attribute("agent.llm.call_count", llmCalls)
                         .attribute("agent.tool.call_count", toolCalls)
                         .attribute("gen_ai.input_tokens", inputTokens)
@@ -419,9 +606,119 @@ public class Agent {
                         .addKeyValue(
                                 "duration_ms", runScope.elapsedMillis())
                         .log("Agent 任务执行失败");
+                boolean cancelled =
+                        error instanceof InterruptedException
+                                || error instanceof java.io.InterruptedIOException
+                                || Thread.currentThread().isInterrupted();
+                events.emit(new UiEvent.AgentChanged(
+                        taskLabel,
+                        cancelled
+                                ? UiEvent.AgentPhase.CANCELLED
+                                : UiEvent.AgentPhase.FAILED,
+                        turns,
+                        0,
+                        partialToolEffects
+                                ? "任务已中断；部分工具操作可能已完成，请先检查工作区"
+                                : cancelled
+                                        ? "任务已取消"
+                                        : safeMessage(error)));
+                if (partialToolEffects) {
+                    throw new PartialExecutionException(error, cancelled);
+                }
                 throw error;
             }
         }
+    }
+
+    /**
+     * Completes the final assistant tool-call block after interruption.
+     *
+     * <p>Chat Completions requires one tool result for every call ID. Keeping
+     * successful results while synthesizing only the missing results preserves
+     * both protocol validity and the evidence of possible side effects.</p>
+     */
+    private void completeInterruptedToolBatch(Message pendingToolReply) {
+        if (pendingToolReply == null
+                || pendingToolReply.toolCalls == null
+                || pendingToolReply.toolCalls.isEmpty()) {
+            return;
+        }
+        int assistantIndex = history.lastIndexOf(pendingToolReply);
+        if (assistantIndex < 0) {
+            return;
+        }
+
+        Set<String> answered = new HashSet<>();
+        for (int i = assistantIndex + 1; i < history.size(); i++) {
+            Message message = history.get(i);
+            if ("tool".equals(message.role)
+                    && message.toolCallId != null) {
+                answered.add(message.toolCallId);
+            }
+        }
+
+        int generatedId = 0;
+        for (ToolCall call : pendingToolReply.toolCalls) {
+            if (call.id == null || call.id.isBlank()) {
+                call.id = "interrupted_tool_" + generatedId++;
+            }
+            if (answered.add(call.id)) {
+                Message result = new Message(
+                        "tool",
+                        "工具调用因任务中断而未完成，执行状态未知。"
+                                + "请检查工作区后再决定是否重试。");
+                result.toolCallId = call.id;
+                history.add(result);
+            }
+        }
+    }
+
+    private void emitCompleted(
+            RunResult result,
+            long startedAt,
+            boolean streamed) {
+        long duration = Math.max(
+                0L, (System.nanoTime() - startedAt) / 1_000_000L);
+        events.emit(new UiEvent.AssistantCompleted(
+                taskLabel,
+                SafeDisplay.redact(result.content()),
+                result.outcome(),
+                result.turns(),
+                result.llmCalls(),
+                result.toolCalls(),
+                result.recoveredErrors(),
+                result.inputTokens(),
+                result.outputTokens(),
+                duration,
+                streamed));
+        events.emit(new UiEvent.AgentChanged(
+                taskLabel,
+                UiEvent.AgentPhase.COMPLETED,
+                result.turns(),
+                0,
+                result.outcome()));
+    }
+
+    private static String safeMessage(Throwable error) {
+        String message = error.getMessage();
+        return message == null || message.isBlank()
+                ? error.getClass().getSimpleName()
+                : message;
+    }
+
+    private static boolean mayHaveMutated(
+            ToolCall call,
+            ToolExecutionResult result) {
+        String name = call == null || call.function == null
+                ? null : call.function.name;
+        if (!ApprovalPolicy.requiresApproval(name)) {
+            return false;
+        }
+        String errorType = result == null ? null : result.errorType();
+        return !"HITL_REJECTED".equals(errorType)
+                && !"HITL_SKIPPED".equals(errorType)
+                && !"TOOL_NOT_FOUND".equals(errorType)
+                && !"CANCELLED".equals(errorType);
     }
 
     // ── Skill 支持 ──

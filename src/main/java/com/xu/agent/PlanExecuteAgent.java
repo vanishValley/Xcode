@@ -1,23 +1,27 @@
 package com.xu.agent;
 
 import com.xu.llm.LlmClient;
-import com.xu.memory.KnowledgeBase;
+import com.xu.memory.LongTermMemory;
 import com.xu.memory.LessonExtractor;
 import com.xu.memory.MemoryManager;
-import com.xu.memory.PlanStore;
 import com.xu.observability.ContextAwareTasks;
 import com.xu.observability.MdcScope;
 import com.xu.observability.TraceScope;
 import com.xu.observability.Tracing;
 import com.xu.plan.ExecutionPlan;
+import com.xu.plan.PlanStore;
 import com.xu.plan.Planner;
 import com.xu.plan.Task;
 import com.xu.skill.SkillRegistry;
 import com.xu.tool.ToolRegistry;
+import com.xu.ui.UiEvent;
+import com.xu.ui.UiEventSink;
+import com.xu.util.CancellationToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.concurrent.*;
 
 import java.util.List;
@@ -50,10 +54,13 @@ public class PlanExecuteAgent {
     private final Planner planner;
     private final LlmClient llmClient;
     private final ToolRegistry toolRegistry;
-    private final KnowledgeBase knowledgeBase;
+    private final LongTermMemory longTermMemory;
     private final String projectPath;
     private final SkillRegistry skillRegistry;
     private final Tracing tracing;
+    private final UiEventSink events;
+    private final CancellationToken cancellation;
+    private final long taskTimeoutMillis;
 
     /** Plan 进度持久化（断点续跑）；为 null 表示不启用持久化 */
     private final PlanStore planStore;
@@ -68,7 +75,8 @@ public class PlanExecuteAgent {
     private static final int MAX_REPLANS = 2;
 
     // 并行执行：单 task 超时和每批线程数
-    private static final int TASK_TIMEOUT_SECONDS = 300;
+    private static final long DEFAULT_TASK_TIMEOUT_MILLIS =
+            TimeUnit.MINUTES.toMillis(5);
     private static final int MAX_PARALLEL_TASKS = 4;
 
     /** 不带持久化(子 Agent / 测试用) */
@@ -83,30 +91,82 @@ public class PlanExecuteAgent {
 
     /** 带 checkpoint + 知识共享(主流程用) */
     public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
-                            PlanStore planStore, KnowledgeBase knowledgeBase, String projectPath) {
-        this(llmClient, toolRegistry, planStore, knowledgeBase, projectPath, null);
+                            PlanStore planStore, LongTermMemory longTermMemory, String projectPath) {
+        this(llmClient, toolRegistry, planStore, longTermMemory, projectPath, null);
     }
 
     /** 带 checkpoint + 知识共享 + Skill(主流程用) */
     public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
-                            PlanStore planStore, KnowledgeBase knowledgeBase,
+                            PlanStore planStore, LongTermMemory longTermMemory,
                             String projectPath, SkillRegistry skillRegistry) {
-        this(llmClient, toolRegistry, planStore, knowledgeBase,
+        this(llmClient, toolRegistry, planStore, longTermMemory,
                 projectPath, skillRegistry, Tracing.noop());
     }
 
     public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
-                            PlanStore planStore, KnowledgeBase knowledgeBase,
+                            PlanStore planStore, LongTermMemory longTermMemory,
                             String projectPath, SkillRegistry skillRegistry,
                             Tracing tracing) {
+        this(llmClient, toolRegistry, planStore, longTermMemory, projectPath,
+                skillRegistry, tracing, UiEventSink.noop());
+    }
+
+    public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
+                            PlanStore planStore, LongTermMemory longTermMemory,
+                            String projectPath, SkillRegistry skillRegistry,
+                            Tracing tracing, UiEventSink events) {
+        this(
+                llmClient,
+                toolRegistry,
+                planStore,
+                longTermMemory,
+                projectPath,
+                skillRegistry,
+                tracing,
+                events,
+                new CancellationToken());
+    }
+
+    public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
+                            PlanStore planStore, LongTermMemory longTermMemory,
+                            String projectPath, SkillRegistry skillRegistry,
+                            Tracing tracing, UiEventSink events,
+                            CancellationToken cancellation) {
+        this(
+                llmClient,
+                toolRegistry,
+                planStore,
+                longTermMemory,
+                projectPath,
+                skillRegistry,
+                tracing,
+                events,
+                cancellation,
+                DEFAULT_TASK_TIMEOUT_MILLIS);
+    }
+
+    PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
+                     PlanStore planStore, LongTermMemory longTermMemory,
+                     String projectPath, SkillRegistry skillRegistry,
+                     Tracing tracing, UiEventSink events,
+                     CancellationToken cancellation,
+                     long taskTimeoutMillis) {
         this.llmClient = llmClient;
         this.toolRegistry = toolRegistry;
         this.planner = new Planner(llmClient);
         this.planStore = planStore;
-        this.knowledgeBase = knowledgeBase;
+        this.longTermMemory = longTermMemory;
         this.projectPath = projectPath;
         this.skillRegistry = skillRegistry;
         this.tracing = tracing;
+        this.events = events == null ? UiEventSink.noop() : events;
+        this.cancellation = cancellation == null
+                ? new CancellationToken() : cancellation;
+        if (taskTimeoutMillis <= 0) {
+            throw new IllegalArgumentException(
+                    "taskTimeoutMillis must be positive");
+        }
+        this.taskTimeoutMillis = taskTimeoutMillis;
     }
 
     /**
@@ -130,12 +190,28 @@ public class PlanExecuteAgent {
             logPlanStarted("PLAN", userRequest.length());
             try {
                 // ===== 阶段 1：初始规划 =====
-                System.out.println("\n[规划阶段] 正在分析任务...");
+                emitPlan(
+                        UiEvent.PlanPhase.PLANNING,
+                        0,
+                        0,
+                        "",
+                        "正在分析并拆解任务",
+                        null);
 
                 ExecutionPlan plan;
                 try {
                     plan = planner.plan(userRequest);
                 } catch (Exception e) {
+                    if (isCancellation(e)) {
+                        throw e;
+                    }
+                    emitPlan(
+                            UiEvent.PlanPhase.FAILED,
+                            0,
+                            0,
+                            "",
+                            "规划失败：" + safeMessage(e),
+                            null);
                     runScope.fail(e);
                     finishPlanRun(
                             runScope, null, stats, "FAILED",
@@ -143,7 +219,13 @@ public class PlanExecuteAgent {
                     return "规划失败：" + e.getMessage();
                 }
 
-                System.out.println(plan.summary());
+                emitPlan(
+                        UiEvent.PlanPhase.PLAN_CREATED,
+                        0,
+                        0,
+                        "",
+                        "已生成 " + plan.size() + " 个步骤",
+                        plan);
                 logger.atInfo()
                         .addKeyValue("event", "plan.run.planned")
                         .addKeyValue("task_count", plan.size())
@@ -151,6 +233,13 @@ public class PlanExecuteAgent {
 
                 String validationError = validate(plan);
                 if (validationError != null) {
+                    emitPlan(
+                            UiEvent.PlanPhase.FAILED,
+                            0,
+                            0,
+                            "",
+                            "计划验证失败",
+                            plan);
                     finishPlanRun(
                             runScope, plan, stats, "FAILED",
                             "PLAN_VALIDATION_FAILED", null);
@@ -158,7 +247,7 @@ public class PlanExecuteAgent {
                 }
 
                 // 初始计划先落一次盘：即使崩在第一个 task 之前，重启也能恢复出这张计划
-                checkpoint(userRequest, 0, plan);
+                checkpointRequired(userRequest, 0, plan);
 
                 String result = runPlan(userRequest, plan, 0, stats);
                 String outcome = plan.isAllSuccess()
@@ -167,8 +256,26 @@ public class PlanExecuteAgent {
                 finishPlanRun(
                         runScope, plan, stats, outcome,
                         stats.stopReason, null);
+                emitPlan(
+                        UiEvent.PlanPhase.COMPLETED,
+                        stats.rounds,
+                        stats.replans,
+                        "",
+                        outcome,
+                        plan);
                 return result;
             } catch (Exception error) {
+                emitPlan(
+                        isCancellation(error)
+                                ? UiEvent.PlanPhase.CANCELLED
+                                : UiEvent.PlanPhase.FAILED,
+                        stats.rounds,
+                        stats.replans,
+                        "",
+                        isCancellation(error)
+                                ? "计划已取消"
+                                : safeMessage(error),
+                        null);
                 runScope.fail(error);
                 finishPlanRun(
                         runScope, null, stats, "FAILED",
@@ -193,9 +300,15 @@ public class PlanExecuteAgent {
             logPlanStarted("PLAN_RESUME", cp.userRequest().length());
             try {
                 ExecutionPlan plan = cp.plan();
-                System.out.println("\n[续跑] 从断点恢复，已完成 "
-                        + plan.getCompletedTasks().size() + "/"
-                        + plan.size() + " 个任务");
+                emitPlan(
+                        UiEvent.PlanPhase.RESUMING,
+                        0,
+                        cp.replanCount(),
+                        "",
+                        "从断点恢复，已完成 "
+                                + plan.getCompletedTasks().size() + "/"
+                                + plan.size() + " 个任务",
+                        plan);
                 String result =
                         runPlan(cp.userRequest(), plan, cp.replanCount(), stats);
                 String outcome = plan.isAllSuccess()
@@ -204,8 +317,26 @@ public class PlanExecuteAgent {
                 finishPlanRun(
                         runScope, plan, stats, outcome,
                         stats.stopReason, null);
+                emitPlan(
+                        UiEvent.PlanPhase.COMPLETED,
+                        stats.rounds,
+                        stats.replans,
+                        "",
+                        outcome,
+                        plan);
                 return result;
             } catch (Exception error) {
+                emitPlan(
+                        isCancellation(error)
+                                ? UiEvent.PlanPhase.CANCELLED
+                                : UiEvent.PlanPhase.FAILED,
+                        stats.rounds,
+                        stats.replans,
+                        "",
+                        isCancellation(error)
+                                ? "计划已取消"
+                                : safeMessage(error),
+                        cp.plan());
                 runScope.fail(error);
                 finishPlanRun(
                         runScope, cp.plan(), stats, "FAILED",
@@ -218,10 +349,11 @@ public class PlanExecuteAgent {
     /**
      * 核心执行循环 —— 初次执行(execute)和续跑(resume)共用。
      *
-     * checkpoint 落盘时机（只在"终态"落盘，绕开 IN_PROGRESS 卡死问题）：
+     * checkpoint 落盘时机：
+     *   - task 提交前先落 IN_PROGRESS（崩溃恢复为未知状态，不自动重放）
      *   - 每个 task 到达 COMPLETED/FAILED 之后
      *   - 每次重规划改动计划结构之后
-     *   - 全部完成后删除存档
+     *   - 全部确定完成后删除；含中断/超时未知状态时保留
      */
     private String runPlan(
             String userRequest,
@@ -229,13 +361,30 @@ public class PlanExecuteAgent {
             int replanCount,
             PlanRunStats stats)
             throws Exception {
+        if (hasInterruptedTasks(plan)) {
+            /*
+             * Safety belongs to the execution layer, not only the CLI.
+             * Direct API callers therefore cannot bypass the non-replayable
+             * checkpoint guard.
+             */
+            stats.replans = replanCount;
+            stats.stopReason = "UNCERTAIN_TASK_STATE";
+            return buildReport(plan, 0, replanCount);
+        }
         // ===== 阶段 2：执行（带重规划）=====
-        System.out.println("[执行阶段] 开始按依赖顺序执行...");
+        emitPlan(
+                UiEvent.PlanPhase.EXECUTING,
+                0,
+                replanCount,
+                "",
+                "开始按依赖顺序执行",
+                plan);
 
         int round = 0;
         stats.replans = replanCount;
 
         while (!plan.isAllComplete() && round < PLAN_MAX_ROUNDS) {
+            ensureNotInterrupted();
             round++;
             stats.rounds = round;
             List<Task> readyTasks = plan.getReadyTasks();
@@ -246,7 +395,13 @@ public class PlanExecuteAgent {
                 if (replanCount < MAX_REPLANS && !plan.getPendingTasks().isEmpty()) {
                     replanCount++;
                     stats.replans = replanCount;
-                    System.out.println("\n[重规划 #" + replanCount + "] 没有就绪任务，尝试重规划...");
+                    emitPlan(
+                            UiEvent.PlanPhase.REPLANNING,
+                            round,
+                            replanCount,
+                            "",
+                            "没有就绪任务，尝试修复计划",
+                            plan);
                     plan = replan(userRequest, plan);
                     checkpoint(userRequest, replanCount, plan);
                     continue;
@@ -265,14 +420,31 @@ public class PlanExecuteAgent {
                 return diag.toString();
             }
 
-            System.out.println("\n--- 第 " + round + " 轮，就绪任务: "
-                    + readyTasks.size() + " 个 ---");
+            emitPlan(
+                    UiEvent.PlanPhase.ROUND_STARTED,
+                    round,
+                    replanCount,
+                    "",
+                    "本轮 " + readyTasks.size() + " 个就绪任务",
+                    plan);
 
             // 标记所有就绪 task 为 IN_PROGRESS（主线程，不存在竞态）
             for (Task task : readyTasks) {
                 plan.updateTask(task.getId(), Task.Status.IN_PROGRESS, "");
-                System.out.println("  执行: " + task.getId() + " — " + task.getDescription());
+                emitPlan(
+                        UiEvent.PlanPhase.TASK_STARTED,
+                        round,
+                        replanCount,
+                        task.getId(),
+                        task.getDescription(),
+                        plan);
             }
+            /*
+             * Persist "started" before submitting workers. If the process
+             * dies after a side effect but before result collection, load()
+             * will classify the step as interrupted instead of replaying it.
+             */
+            checkpointRequired(userRequest, replanCount, plan);
 
             // 并行提交：每批创建 daemon 线程池，用完即清理
             int parallelism = Math.min(readyTasks.size(), MAX_PARALLEL_TASKS);
@@ -282,56 +454,143 @@ public class PlanExecuteAgent {
                 return t;
             });
             boolean anyFailedThisRound = false;
+            CompletionService<TaskResult> completion =
+                    new ExecutorCompletionService<>(executor);
+            Map<Future<TaskResult>, RunningTask> running =
+                    new LinkedHashMap<>();
             try {
-                List<CompletableFuture<TaskResult>> futures = new ArrayList<>();
                 for (Task task : readyTasks) {
                     final String taskPrompt = buildTaskPrompt(task, plan);
-                    // CompletableFuture 不会自动传播 ThreadLocal/MDC；
-                    // wrap() 在提交线程捕获父 Context，让 plan.task 仍属于本次 agent.run。
-                    CompletableFuture<TaskResult> cf = CompletableFuture
-                            .supplyAsync(ContextAwareTasks.wrap(
-                                    () -> executeOneTask(
-                                            task, taskPrompt, userRequest)),
-                                    executor)
-                            .orTimeout(TASK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                            .exceptionally(ex -> failedTaskResult(
-                                    task.getId(),
-                                    "执行超时或异常: " + safeMessage(ex),
-                                    "TIMEOUT_OR_ASYNC_FAILURE"));
-                    futures.add(cf);
+                    CancellationToken taskCancellation =
+                            cancellation.childScope();
+                    var work = ContextAwareTasks.wrap(
+                            () -> executeOneTask(
+                                    task,
+                                    taskPrompt,
+                                    userRequest,
+                                    taskCancellation));
+                    Future<TaskResult> future =
+                            completion.submit(work::get);
+                    running.put(
+                            future,
+                            new RunningTask(
+                                    task,
+                                    taskCancellation,
+                                    System.nanoTime()
+                                            + TimeUnit.MILLISECONDS.toNanos(
+                                                    taskTimeoutMillis)));
                 }
 
-                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-                // 收集结果：主线程统一更新 plan，避免并发写
-                for (CompletableFuture<TaskResult> cf : futures) {
-                    TaskResult r = cf.getNow(null);
-                    plan.updateTask(r.taskId, r.status, r.result);
-                    stats.add(r);
-                    if (r.status == Task.Status.FAILED) {
-                        anyFailedThisRound = true;
-                        if ("TIMEOUT_OR_ASYNC_FAILURE".equals(r.errorType)) {
-                            try (MdcScope ignored =
-                                         MdcScope.put("task_id", r.taskId)) {
-                                logger.atError()
-                                        .addKeyValue(
-                                                "event",
-                                                "plan.task.failed")
-                                        .addKeyValue(
-                                                "outcome", "FAILED")
-                                        .addKeyValue(
-                                                "error_type", r.errorType)
-                                        .log("Plan 子任务超时或异步执行失败");
-                            }
+                /*
+                 * Collect in actual completion order. Unlike
+                 * CompletableFuture.orTimeout, these are the real executor
+                 * Futures, so a timeout can interrupt the underlying worker
+                 * and cancel its task-scoped token.
+                 */
+                while (!running.isEmpty()) {
+                    ensureNotInterrupted();
+                    long waitStartedAt = System.nanoTime();
+                    long waitNanos = running.values().stream()
+                            .mapToLong(value ->
+                                    Math.max(
+                                            0L,
+                                            value.deadlineNanos()
+                                                    - waitStartedAt))
+                            .min()
+                            .orElse(0L);
+                    Future<TaskResult> finished = completion.poll(
+                            waitNanos, TimeUnit.NANOSECONDS);
+                    if (finished != null) {
+                        RunningTask metadata = running.remove(finished);
+                        if (metadata == null) {
+                            continue;
                         }
+                        TaskResult result;
+                        try {
+                            result = finished.get();
+                        } catch (CancellationException cancelled) {
+                            result = failedTaskResult(
+                                    metadata.task().getId(),
+                                    "执行已取消",
+                                    "TASK_CANCELLED");
+                        } catch (ExecutionException failed) {
+                            result = failedTaskResult(
+                                    metadata.task().getId(),
+                                    "执行异常: " + safeMessage(failed),
+                                    "ASYNC_FAILURE");
+                        }
+                        anyFailedThisRound |= applyTaskResult(
+                                userRequest,
+                                replanCount,
+                                plan,
+                                stats,
+                                round,
+                                result);
+                        continue;
                     }
-                    System.out.println("  " + r.icon + " " + r.taskId + " — " + r.summary);
+
+                    long timeoutNow = System.nanoTime();
+                    List<Map.Entry<Future<TaskResult>, RunningTask>>
+                            expired = running.entrySet().stream()
+                                    .filter(entry ->
+                                            entry.getValue()
+                                                    .deadlineNanos()
+                                                    <= timeoutNow)
+                                    .toList();
+                    for (var entry : expired) {
+                        RunningTask metadata = entry.getValue();
+                        metadata.cancellation().cancel();
+                        entry.getKey().cancel(true);
+                        running.remove(entry.getKey());
+                        TaskResult timeout = failedTaskResult(
+                                metadata.task().getId(),
+                                PlanStore.INTERRUPTED_RESULT_PREFIX
+                                        + "执行超时（"
+                                        + timeoutLabel() + "）"
+                                        + "；部分副作用可能已经发生，"
+                                        + "不会自动重试",
+                                "TASK_TIMEOUT");
+                        anyFailedThisRound |= applyTaskResult(
+                                userRequest,
+                                replanCount,
+                                plan,
+                                stats,
+                                round,
+                                timeout);
+                    }
                 }
 
-                // 本轮全部完成后统一落盘
+            } catch (Exception error) {
+                /*
+                 * A cancelled batch must never be persisted with tasks stuck
+                 * in IN_PROGRESS. Completed results already consumed above
+                 * remain terminal; uncertain work is never replayed
+                 * automatically because it may already have side effects.
+                 */
+                markInterruptedTasks(plan);
                 checkpoint(userRequest, replanCount, plan);
+                throw error;
             } finally {
+                running.forEach((future, metadata) -> {
+                    metadata.cancellation().cancel();
+                    future.cancel(true);
+                });
                 executor.shutdownNow();
+                if (!awaitTermination(executor, 2, TimeUnit.SECONDS)) {
+                    cancellation.markUnsafeToReuse();
+                    cancellation.cancel();
+                }
+            }
+            ensureNotInterrupted();
+
+            if (hasInterruptedTasks(plan)) {
+                /*
+                 * Timeout/cancellation has unknown external state. Replanning
+                 * could execute the same mutation a second time, so stop at
+                 * the durable checkpoint and require explicit inspection.
+                 */
+                stats.stopReason = "UNCERTAIN_TASK_STATE";
+                break;
             }
 
             // ---- 重规划逻辑 ----
@@ -342,8 +601,13 @@ public class PlanExecuteAgent {
 
                 replanCount++;
                 stats.replans = replanCount;
-                System.out.println("\n[重规划 #" + replanCount
-                        + "] 检测到步骤失败，基于已完成的进度重新规划...");
+                emitPlan(
+                        UiEvent.PlanPhase.REPLANNING,
+                        round,
+                        replanCount,
+                        "",
+                        "检测到步骤失败，基于当前进度重新规划",
+                        plan);
                 plan = replan(userRequest, plan);
                 checkpoint(userRequest, replanCount, plan);
             }
@@ -352,10 +616,13 @@ public class PlanExecuteAgent {
         // ===== 阶段 3：汇总报告 + 清理 =====
         // 全部到终态才删档；因 PLAN_MAX_ROUNDS 退出但仍有 PENDING 时保留存档，
         // 这正是"任务太长没跑完"的合法续跑场景。
-        if (plan.isAllComplete() && planStore != null) {
+        boolean interrupted = hasInterruptedTasks(plan);
+        if (plan.isAllComplete() && !interrupted && planStore != null) {
             planStore.delete();
         }
-        if (!plan.isAllComplete()) {
+        if (interrupted) {
+            stats.stopReason = "UNCERTAIN_TASK_STATE";
+        } else if (!plan.isAllComplete()) {
             stats.stopReason = "MAX_ROUNDS";
         } else if (!plan.isAllSuccess()) {
             stats.stopReason = "TASK_FAILED";
@@ -479,10 +746,28 @@ public class PlanExecuteAgent {
                         .count();
     }
 
-    /** 落 checkpoint。planStore 为 null（未启用持久化）时无操作；写失败由 PlanStore 内部兜底。 */
-    private void checkpoint(String userRequest, int replanCount, ExecutionPlan plan) {
-        if (planStore != null) {
-            planStore.save(new PlanStore.Checkpoint(userRequest, replanCount, plan));
+    /** Best-effort terminal checkpoint; returns whether persistence succeeded. */
+    private boolean checkpoint(
+            String userRequest,
+            int replanCount,
+            ExecutionPlan plan) {
+        return planStore == null
+                || planStore.save(new PlanStore.Checkpoint(
+                        userRequest, replanCount, plan));
+    }
+
+    /**
+     * A mutation may start only after its IN_PROGRESS state is durable.
+     * Otherwise a stale PENDING checkpoint could replay the same side effect
+     * after a crash.
+     */
+    private void checkpointRequired(
+            String userRequest,
+            int replanCount,
+            ExecutionPlan plan) throws java.io.IOException {
+        if (!checkpoint(userRequest, replanCount, plan)) {
+            throw new java.io.IOException(
+                    "无法持久化 Plan 检查点；为避免重复执行，未启动任何 Worker");
         }
     }
 
@@ -547,7 +832,13 @@ public class PlanExecuteAgent {
             oldPlan.addTask(newTask);
         }
 
-        System.out.println("重规划后：\n" + oldPlan.summary());
+        emitPlan(
+                UiEvent.PlanPhase.PLAN_CREATED,
+                0,
+                0,
+                "",
+                "重规划完成",
+                oldPlan);
 
         String err = validate(oldPlan);
         if (err != null) {
@@ -638,7 +929,11 @@ public class PlanExecuteAgent {
             }
         }
 
-        if (plan.isAllSuccess()) {
+        if (hasInterruptedTasks(plan)) {
+            sb.append("\n⛔ 至少一个步骤在执行中断或超时，"
+                    + "其外部副作用状态未知。已保留检查点，"
+                    + "请检查工作区后再决定是否创建新计划。");
+        } else if (plan.isAllSuccess()) {
             sb.append("\n🎉 所有步骤执行成功！");
         } else if (plan.isAllComplete()) {
             sb.append("\n⚠️ 执行完成，但部分步骤失败。");
@@ -738,6 +1033,7 @@ public class PlanExecuteAgent {
         private long workerInputTokens;
         private long workerOutputTokens;
         private boolean workerDegraded;
+        private boolean mutatingToolUsed;
 
         private void add(Agent.RunResult result) {
             workerAttempts++;
@@ -748,6 +1044,7 @@ public class PlanExecuteAgent {
             workerInputTokens += result.inputTokens();
             workerOutputTokens += result.outputTokens();
             workerDegraded |= !"SUCCESS".equals(result.outcome());
+            mutatingToolUsed |= result.mutatingToolUsed();
         }
     }
 
@@ -770,11 +1067,21 @@ public class PlanExecuteAgent {
             long workerOutputTokens) {
     }
 
+    private record RunningTask(
+            Task task,
+            CancellationToken cancellation,
+            long deadlineNanos) {
+    }
+
     /**
      * 执行一个子任务（Worker + Review + 重做），供并行线程调用。
      * 不碰 plan.updateTask（交给主线程收集结果后统一做），不写 checkpoint。
      */
-    private TaskResult executeOneTask(Task task, String taskPrompt, String userRequest) {
+    private TaskResult executeOneTask(
+            Task task,
+            String taskPrompt,
+            String userRequest,
+            CancellationToken taskCancellation) {
         TaskRunStats stats = new TaskRunStats();
 
         // 一个 plan.task 覆盖 Worker 执行、Reviewer 审查及可能的重做。
@@ -792,38 +1099,47 @@ public class PlanExecuteAgent {
                             task.getDependencies().size())
                     .log("Plan 子任务开始");
             try {
+                taskCancellation.throwIfCancellationRequested();
                 /*
                  * 创建子 Agent，并把同一个 SkillRegistry 继续向下传递。
                  * 因此普通 ReAct 模式和 /plan 拆出的 Worker 使用同一套联网决策规则，
                  * 不会出现主 Agent 会联网、子 Agent 却看不到 web-access 的情况。
                  */
-                Agent subAgent = createSubAgent(task, userRequest);
+                Agent subAgent = createSubAgent(
+                        task, userRequest, taskCancellation);
                 Agent.RunResult workerResult =
                         subAgent.runDetailed(taskPrompt);
+                taskCancellation.throwIfCancellationRequested();
                 stats.add(workerResult);
                 String result = workerResult.content();
 
                 // 自动沉淀
-                if (knowledgeBase != null && projectPath != null) {
+                if (longTermMemory != null && projectPath != null) {
+                    taskCancellation.throwIfCancellationRequested();
                     LessonExtractor.tryExtract(
                             subAgent.getHistory(),
                             llmClient,
-                            knowledgeBase,
+                            longTermMemory,
                             projectPath);
                 }
 
                 // Review + 打回重做(最多 2 次)
                 boolean taskPassed = false;
                 String reviewFeedback = "";
-                Reviewer reviewer = new Reviewer(llmClient, tracing);
+                Reviewer reviewer =
+                        new Reviewer(
+                                llmClient, tracing, taskCancellation);
                 for (int retry = 0; retry < 3; retry++) {
+                    taskCancellation.throwIfCancellationRequested();
                     if (retry > 0) {
                         String retryPrompt = taskPrompt
                                 + "\n\n【审查反馈】上次结果被驳回: "
                                 + reviewFeedback
                                 + "\n请修正后重新执行。";
-                        subAgent = createSubAgent(task, userRequest);
+                        subAgent = createSubAgent(
+                                task, userRequest, taskCancellation);
                         workerResult = subAgent.runDetailed(retryPrompt);
+                        taskCancellation.throwIfCancellationRequested();
                         stats.add(workerResult);
                         result = workerResult.content();
                     }
@@ -836,6 +1152,28 @@ public class PlanExecuteAgent {
                         break;
                     }
                     reviewFeedback = String.join("; ", review.issues());
+                    if (stats.mutatingToolUsed) {
+                        /*
+                         * A fresh Agent would not know which external changes
+                         * the rejected attempt already made. Automatic redo
+                         * could repeat non-idempotent commands or writes.
+                         */
+                        recordTaskMetrics(taskScope, "FAILED", stats);
+                        logTaskCompleted(taskScope, "FAILED", stats);
+                        return taskResult(
+                                task,
+                                Task.Status.FAILED,
+                                PlanStore.INTERRUPTED_RESULT_PREFIX
+                                        + "审查未通过，但本次 Worker 已执行"
+                                        + "变更型工具；为避免重复副作用，"
+                                        + "未自动重做。审查意见："
+                                        + reviewFeedback,
+                                "❌",
+                                "审查未通过；变更已发生，需人工检查",
+                                "FAILED",
+                                "REVIEW_REJECTED_AFTER_MUTATION",
+                                stats);
+                    }
                 }
 
                 String finalResult = taskPassed
@@ -859,12 +1197,26 @@ public class PlanExecuteAgent {
             } catch (Exception e) {
                 taskScope.fail(e);
                 recordTaskMetrics(taskScope, "FAILED", stats);
+                boolean uncertain =
+                        e instanceof Agent.PartialExecutionException
+                                || stats.workerToolCalls > 0;
+                String result = uncertain
+                        ? PlanStore.INTERRUPTED_RESULT_PREFIX
+                                + "子任务在工具执行后中断，"
+                                + "外部副作用状态未知；不会自动重试。"
+                        : "执行异常: " + safeMessage(e);
+                String summary = uncertain
+                        ? "状态未知：请先检查工作区"
+                        : "失败: " + safeMessage(e);
+                String errorType = uncertain
+                        ? "PARTIAL_TOOL_EFFECTS"
+                        : e.getClass().getSimpleName();
                 logger.atError()
                         .addKeyValue("event", "plan.task.failed")
                         .addKeyValue("outcome", "FAILED")
                         .addKeyValue(
                                 "error_type",
-                                e.getClass().getSimpleName())
+                                errorType)
                         .addKeyValue(
                                 "worker_attempts", stats.workerAttempts)
                         .addKeyValue(
@@ -876,21 +1228,26 @@ public class PlanExecuteAgent {
                 return taskResult(
                         task,
                         Task.Status.FAILED,
-                        "执行异常: " + safeMessage(e),
+                        result,
                         "❌",
-                        "失败: " + safeMessage(e),
+                        summary,
                         "FAILED",
-                        e.getClass().getSimpleName(),
+                        errorType,
                         stats);
             }
         }
     }
 
     /** 为首次执行和审查打回后的重做创建隔离的 Worker Agent。 */
-    private Agent createSubAgent(Task task, String userRequest) {
+    private Agent createSubAgent(
+            Task task,
+            String userRequest,
+            CancellationToken taskCancellation) {
         MemoryManager subMemory;
-        if (knowledgeBase != null && projectPath != null) {
-            subMemory = new MemoryManager(knowledgeBase, projectPath);
+        if (longTermMemory != null && projectPath != null) {
+            subMemory = new MemoryManager(
+                    longTermMemory,
+                    projectPath);
             subMemory.setGoal("【总任务】" + userRequest
                     + "\n【当前步骤】" + task.getDescription());
         } else {
@@ -902,7 +1259,137 @@ public class PlanExecuteAgent {
                 subMemory,
                 skillRegistry,
                 task.getId(),
-                tracing);
+                tracing,
+                events,
+                taskCancellation);
+    }
+
+    private void emitPlan(
+            UiEvent.PlanPhase phase,
+            int round,
+            int replanCount,
+            String taskId,
+            String message,
+            ExecutionPlan plan) {
+        List<UiEvent.PlanTaskView> tasks = plan == null
+                ? List.of()
+                : plan.getAllTasks().stream()
+                        .map(UiEvent.PlanTaskView::from)
+                        .toList();
+        events.emit(new UiEvent.PlanChanged(
+                phase,
+                round,
+                replanCount,
+                taskId,
+                message,
+                tasks));
+    }
+
+    private void ensureNotInterrupted() throws InterruptedException {
+        cancellation.throwIfCancellationRequested();
+    }
+
+    private String timeoutLabel() {
+        if (taskTimeoutMillis % 1000L == 0L) {
+            return (taskTimeoutMillis / 1000L) + " 秒";
+        }
+        return taskTimeoutMillis + " 毫秒";
+    }
+
+    private static boolean hasInterruptedTasks(ExecutionPlan plan) {
+        return plan != null
+                && plan.getAllTasks().stream()
+                        .anyMatch(task ->
+                                task.getStatus() == Task.Status.FAILED
+                                && task.getResult() != null
+                                && task.getResult().startsWith(
+                                        PlanStore.INTERRUPTED_RESULT_PREFIX));
+    }
+
+    private static void markInterruptedTasks(ExecutionPlan plan) {
+        for (Task task : plan.getAllTasks()) {
+            if (task.getStatus() == Task.Status.IN_PROGRESS) {
+                plan.updateTask(
+                        task.getId(),
+                        Task.Status.FAILED,
+                        PlanStore.INTERRUPTED_RESULT_PREFIX
+                                + "步骤在运行中被取消；可能已产生部分副作用，"
+                                + "不会自动重试。");
+            }
+        }
+    }
+
+    private boolean applyTaskResult(
+            String userRequest,
+            int replanCount,
+            ExecutionPlan plan,
+            PlanRunStats stats,
+            int round,
+            TaskResult result) {
+        plan.updateTask(
+                result.taskId, result.status, result.result);
+        /*
+         * Persist every terminal transition immediately. A sibling may still
+         * be running when Ctrl+C arrives; batch-only persistence would replay
+         * already completed side effects after restart.
+         */
+        checkpoint(userRequest, replanCount, plan);
+        stats.add(result);
+        boolean failed = result.status == Task.Status.FAILED;
+        if (failed) {
+            try (MdcScope ignored =
+                         MdcScope.put("task_id", result.taskId)) {
+                logger.atError()
+                        .addKeyValue("event", "plan.task.failed")
+                        .addKeyValue("outcome", "FAILED")
+                        .addKeyValue(
+                                "error_type", result.errorType)
+                        .log("Plan 子任务超时或异步执行失败");
+            }
+        }
+        emitPlan(
+                UiEvent.PlanPhase.TASK_COMPLETED,
+                round,
+                replanCount,
+                result.taskId,
+                result.summary,
+                plan);
+        return failed;
+    }
+
+    private static boolean awaitTermination(
+            ExecutorService executor,
+            long timeout,
+            TimeUnit unit) {
+        long deadline = System.nanoTime() + unit.toNanos(timeout);
+        boolean interrupted = false;
+        try {
+            while (!executor.isTerminated()) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0L) {
+                    return false;
+                }
+                try {
+                    if (executor.awaitTermination(
+                            remaining, TimeUnit.NANOSECONDS)) {
+                        return true;
+                    }
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+            return true;
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private static boolean isCancellation(Throwable error) {
+        return error instanceof InterruptedException
+                || error instanceof java.io.InterruptedIOException
+                || Thread.currentThread().isInterrupted();
     }
 
     /** 把 Task 统计同时写入 Span，便于以后接 Jaeger 时查看。 */

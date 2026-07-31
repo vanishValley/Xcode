@@ -5,6 +5,7 @@ import com.xu.observability.Tracing;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -91,6 +92,50 @@ class ToolExecutorTest {
         assertEquals("COMMAND_EXIT_NON_ZERO", result.errorType());
         assertEquals(7, result.exitCode());
         assertFalse(result.timedOut());
+    }
+
+    @Test
+    void interruptedThreadMustNotEnterToolImplementation() {
+        ToolRegistry registry = new ToolRegistry();
+        AtomicInteger invocations = new AtomicInteger();
+        registry.register(tool("write", args -> {
+            invocations.incrementAndGet();
+            return "changed";
+        }));
+
+        Thread.currentThread().interrupt();
+        try {
+            ToolExecutionResult result =
+                    new ToolExecutor(registry, Tracing.noop())
+                            .execute(call("write", "{}"));
+
+            assertFalse(result.success());
+            assertEquals("CANCELLED", result.errorType());
+            assertEquals(0, invocations.get());
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void interruptedToolMustRestoreFlagAndStopTheChain() {
+        ToolRegistry registry = new ToolRegistry();
+        registry.register(tool("blocking", args -> {
+            throw new InterruptedException("cancel");
+        }));
+
+        try {
+            ToolExecutionResult result =
+                    new ToolExecutor(registry, Tracing.noop())
+                            .execute(call("blocking", "{}"));
+
+            assertFalse(result.success());
+            assertEquals("CANCELLED", result.errorType());
+            assertTrue(Thread.currentThread().isInterrupted());
+        } finally {
+            Thread.interrupted();
+        }
     }
 
     private static LlmClient.ToolCall call(

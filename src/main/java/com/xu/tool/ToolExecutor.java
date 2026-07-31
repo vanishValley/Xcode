@@ -5,10 +5,16 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xu.llm.LlmClient.ToolCall;
 import com.xu.observability.TraceScope;
 import com.xu.observability.Tracing;
+import com.xu.ui.SafeDisplay;
+import com.xu.ui.UiEvent;
+import com.xu.ui.UiEventSink;
+import com.xu.util.CancellationToken;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.InterruptedIOException;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 
 /**
  * 统一执行模型返回的 ToolCall。
@@ -23,11 +29,46 @@ public final class ToolExecutor {
 
     private final ToolRegistry registry;
     private final Tracing tracing;
+    private final UiEventSink events;
+    private final String taskLabel;
+    private final CancellationToken cancellation;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public ToolExecutor(ToolRegistry registry, Tracing tracing) {
+        this(
+                registry,
+                tracing,
+                UiEventSink.noop(),
+                "main",
+                new CancellationToken());
+    }
+
+    public ToolExecutor(
+            ToolRegistry registry,
+            Tracing tracing,
+            UiEventSink events,
+            String taskLabel) {
+        this(
+                registry,
+                tracing,
+                events,
+                taskLabel,
+                new CancellationToken());
+    }
+
+    public ToolExecutor(
+            ToolRegistry registry,
+            Tracing tracing,
+            UiEventSink events,
+            String taskLabel,
+            CancellationToken cancellation) {
         this.registry = registry;
         this.tracing = tracing;
+        this.events = events == null ? UiEventSink.noop() : events;
+        this.taskLabel = taskLabel == null || taskLabel.isBlank()
+                ? "main" : taskLabel;
+        this.cancellation = cancellation == null
+                ? new CancellationToken() : cancellation;
     }
 
     /**
@@ -46,6 +87,9 @@ public final class ToolExecutor {
         String arguments = call != null && call.function != null
                 ? call.function.arguments : "";
         String callId = call == null ? null : call.id;
+        long startedAt = System.nanoTime();
+        Map<String, Object> parsedArguments = Map.of();
+        Map<String, Object> displayArguments = Map.of();
 
         // 不记录参数正文，只记录长度，避免命令、源码或敏感数据进入日志。
         try (TraceScope scope = tracing.start("tool.execute")
@@ -55,6 +99,36 @@ public final class ToolExecutor {
                         toolName.startsWith("mcp__") ? "mcp" : "local")
                 .attribute("tool.arguments_chars",
                         arguments == null ? 0L : arguments.length())) {
+
+            try {
+                parsedArguments = arguments == null || arguments.isBlank()
+                        ? Map.of()
+                        : objectMapper.readValue(
+                                arguments,
+                                new TypeReference<Map<String, Object>>() {});
+                displayArguments = SafeDisplay.arguments(parsedArguments);
+            } catch (Exception parseError) {
+                events.emit(new UiEvent.ToolStarted(
+                        taskLabel, callId, toolName, Map.of()));
+                scope.fail(parseError);
+                scope.attribute("tool.status", "ERROR");
+                String errorType = parseError.getClass().getSimpleName();
+                ToolExecutionResult failure = ToolExecutionResult.failure(
+                        "工具参数解析出错：" + safeMessage(parseError),
+                        errorType);
+                logException(
+                        toolName,
+                        callId,
+                        errorType,
+                        scope.elapsedMillis(),
+                        parseError);
+                emitCompleted(
+                        callId, toolName, Map.of(), failure, startedAt);
+                return failure;
+            }
+
+            events.emit(new UiEvent.ToolStarted(
+                    taskLabel, callId, toolName, displayArguments));
 
             Tool tool = registry.get(toolName);
             if (tool == null) {
@@ -66,19 +140,22 @@ public final class ToolExecutor {
                         "TOOL_NOT_FOUND",
                         scope.elapsedMillis(),
                         null);
-                return ToolExecutionResult.failure(
+                ToolExecutionResult failure = ToolExecutionResult.failure(
                         message, "TOOL_NOT_FOUND");
+                emitCompleted(
+                        callId,
+                        toolName,
+                        displayArguments,
+                        failure,
+                        startedAt);
+                return failure;
             }
 
             try {
-                Map<String, Object> parsedArguments =
-                        arguments == null || arguments.isBlank()
-                                ? Map.of()
-                                : objectMapper.readValue(
-                                        arguments,
-                                        new TypeReference<Map<String, Object>>() {});
+                cancellation.throwIfCancellationRequested();
                 ToolExecutionResult execution =
                         tool.executeObserved(parsedArguments);
+                cancellation.throwIfCancellationRequested();
                 if (execution == null) {
                     throw new IllegalStateException(
                             "工具返回了 null 执行结果");
@@ -122,6 +199,12 @@ public final class ToolExecutor {
                                     "duration_ms", scope.elapsedMillis());
                     addProcessFields(event, normalized);
                     event.log("工具执行完成");
+                    emitCompleted(
+                            callId,
+                            toolName,
+                            displayArguments,
+                            normalized,
+                            startedAt);
                     return normalized;
                 }
 
@@ -133,22 +216,85 @@ public final class ToolExecutor {
                         errorType,
                         normalized,
                         scope.elapsedMillis());
+                emitCompleted(
+                        callId,
+                        toolName,
+                        displayArguments,
+                        normalized,
+                        startedAt);
                 return normalized;
             } catch (Exception error) {
+                boolean cancelled = isCancellation(error);
+                if (cancelled) {
+                    /*
+                     * InterruptedException clears the flag when thrown.
+                     * Restore it so Agent stops before another tool call.
+                     */
+                    Thread.currentThread().interrupt();
+                }
                 scope.fail(error);
                 scope.attribute("tool.status", "ERROR");
-                String errorType = error.getClass().getSimpleName();
+                String errorType = cancelled
+                        ? "CANCELLED"
+                        : error.getClass().getSimpleName();
                 logException(
                         toolName,
                         callId,
                         errorType,
                         scope.elapsedMillis(),
                         error);
-                return ToolExecutionResult.failure(
-                        "工具执行出错：" + safeMessage(error),
+                ToolExecutionResult failure = ToolExecutionResult.failure(
+                        cancelled
+                                ? "工具执行已取消"
+                                : "工具执行出错：" + safeMessage(error),
                         errorType);
+                emitCompleted(
+                        callId,
+                        toolName,
+                        displayArguments,
+                        failure,
+                        startedAt);
+                return failure;
             }
         }
+    }
+
+    private static boolean isCancellation(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof InterruptedException
+                    || current instanceof InterruptedIOException
+                    || current instanceof CancellationException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return Thread.currentThread().isInterrupted();
+    }
+
+    private void emitCompleted(
+            String callId,
+            String toolName,
+            Map<String, Object> displayArguments,
+            ToolExecutionResult result,
+            long startedAt) {
+        ToolExecutionResult displayResult = new ToolExecutionResult(
+                result.success(),
+                result.success()
+                        ? ""
+                        : SafeDisplay.errorPreview(result.content()),
+                result.errorType(),
+                result.exitCode(),
+                result.timedOut());
+        events.emit(new UiEvent.ToolCompleted(
+                taskLabel,
+                callId,
+                toolName,
+                displayArguments,
+                displayResult,
+                Math.max(
+                        0L,
+                        (System.nanoTime() - startedAt) / 1_000_000L)));
     }
 
     private static void logReportedFailure(

@@ -33,6 +33,6 @@ public interface Tool {
      */
     default ToolExecutionResult executeObserved(
             Map<String, Object> arguments) throws Exception {
-        return ToolExecutionResult.success(execute(arguments));
+        return ToolExecutionResult.fromLegacyText(execute(arguments));
     }
 }
