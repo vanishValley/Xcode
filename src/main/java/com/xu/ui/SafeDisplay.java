@@ -13,11 +13,10 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Builds bounded, redacted values that are safe to put on the UI event bus.
+ * 生成经过限长和脱敏、可安全进入 UI 事件总线的显示数据。
  *
- * <p>Raw tool arguments are deliberately never stored in UI events. This is a
- * second boundary in addition to log redaction: renderers, tests and future
- * front-ends can only observe the display model produced here.</p>
+ * <p>UI 事件不保存原始工具参数，这是日志脱敏之外的第二道边界；渲染器、测试和后续前端
+ * 只能读取本类生成的显示模型。</p>
  */
 public final class SafeDisplay {
 
@@ -96,7 +95,7 @@ public final class SafeDisplay {
         return truncate(redact(value == null ? "" : value), 320);
     }
 
-    /** Registers an exact runtime credential as an additional display guard. */
+    /** 注册运行时真实凭据，作为规则脱敏之外的精确匹配保护。 */
     public static void registerSecret(String value) {
         if (value != null && value.length() >= 8) {
             REGISTERED_SECRETS.add(value);

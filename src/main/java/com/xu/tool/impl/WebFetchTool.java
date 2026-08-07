@@ -1,6 +1,7 @@
 package com.xu.tool.impl;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xu.http.OkHttpCallExecutor;
 import com.xu.tool.Tool;
 import okhttp3.Dns;
 import okhttp3.OkHttpClient;
@@ -104,7 +105,7 @@ public class WebFetchTool implements Tool {
                     .build();
 
             try {
-                FetchedResponse response = InterruptibleHttp.execute(
+                FetchedResponse response = OkHttpCallExecutor.executeInterruptibly(
                         httpClient.newCall(request),
                         WebFetchTool::bufferResponse);
                 int code = response.code();
@@ -223,8 +224,9 @@ public class WebFetchTool implements Tool {
         output.put("message", message);
         output.put("url", url);
         output.put("nextAction",
-                "调用 mcp__chrome-devtools__navigate_page 打开该 URL，"
-                        + "然后调用 mcp__chrome-devtools__take_snapshot 读取页面。");
+                "如果 Chrome MCP 工具尚未注册，先调用 start_chrome_mcp；"
+                        + "启动成功后的下一轮调用 mcp__chrome-devtools__navigate_page "
+                        + "打开该 URL，再调用 mcp__chrome-devtools__take_snapshot 读取页面。");
         return mapper.writeValueAsString(output);
     }
 
@@ -324,7 +326,7 @@ public class WebFetchTool implements Tool {
 
         if (address instanceof Inet6Address && bytes.length == 16) {
             int first = bytes[0] & 0xFF;
-            if ((first & 0xFE) == 0xFC) return true; // fc00::/7
+            if ((first & 0xFE) == 0xFC) return true; // IPv6 唯一本地地址段 fc00::/7。
 
             boolean mapped = true;
             for (int i = 0; i < 10; i++) mapped &= bytes[i] == 0;

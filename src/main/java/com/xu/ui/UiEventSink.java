@@ -1,16 +1,13 @@
 package com.xu.ui;
 
-/**
- * Destination for user-interface events.
- */
+/** 用户界面事件的发布目标。 */
 @FunctionalInterface
 public interface UiEventSink {
 
     void emit(UiEvent event);
 
     /**
-     * Only the rich TUI opts into streamed main-agent output. Plain CLI and
-     * tests keep the original non-streaming HTTP path for compatibility.
+     * 仅富终端启用主 Agent 流式输出；plain CLI 和测试保留非流式 HTTP 路径以兼容旧行为。
      */
     default boolean supportsStreaming() {
         return false;
@@ -18,7 +15,7 @@ public interface UiEventSink {
 
     static UiEventSink noop() {
         return event -> {
-            // Deliberately empty.
+            // 空实现用于不需要界面事件的调用方。
         };
     }
 }

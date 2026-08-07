@@ -40,7 +40,7 @@ public class ExecuteCommandTool implements Tool {
             "rm -rf /", "rm -rf ~", "rm -rf .",
             // 格式化 / 清盘
             "mkfs", "dd if=", "dd of=",
-            // fork bomb
+            // 进程炸弹
             ":(){ :|:& };:", "%0|%0",
             // 管道执行远程脚本
             "curl", "wget", "| sh", "| bash",
@@ -196,9 +196,8 @@ public class ExecuteCommandTool implements Tool {
     }
 
     /**
-     * Takes a descendant snapshot before killing the shell. On Windows,
-     * terminating only {@code cmd /c} can leave Maven, Java or Node children
-     * running after the user presses Ctrl+C.
+     * 终止 Shell 前先记录其全部子进程。Windows 上若只结束 {@code cmd /c}，
+     * Maven、Java 或 Node 子进程可能在用户按下 Ctrl+C 后继续运行。
      */
     private static void destroyProcessTree(Process process) {
         List<ProcessHandle> descendants =
@@ -225,7 +224,7 @@ public class ExecuteCommandTool implements Tool {
             try {
                 return Charset.forName(configured.strip());
             } catch (RuntimeException ignored) {
-                // Fall back to the platform-safe default below.
+                // 配置无效时使用下方的平台安全默认值。
             }
         }
         return windows ? Charset.defaultCharset()

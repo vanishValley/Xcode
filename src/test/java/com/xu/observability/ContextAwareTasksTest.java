@@ -51,7 +51,7 @@ class ContextAwareTasksTest {
         String[] childIds;
 
         try (MdcScope ignored = MdcScope.put("task_id", "task_1");
-             TraceScope root = tracing.start("agent.run")) {
+             TraceScope root = tracing.start("coding.task")) {
             rootTraceId = root.traceId();
             rootSpanId = root.spanId();
 

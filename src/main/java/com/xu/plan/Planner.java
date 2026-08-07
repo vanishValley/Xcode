@@ -9,28 +9,14 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 规划器 —— 把用户的自然语言任务拆成结构化执行计划。
- *
- * 工作原理：
- *   1. 用特制的 system prompt 告诉 LLM "你是规划专家"
- *   2. 把用户任务发过去，要求 LLM 输出 JSON 格式的步骤列表
- *   3. 解析 JSON，构建 ExecutionPlan
- *
- * 为什么需要专门的 Planner 而不是复用 Agent？
- *   规划是一个"纯思考"过程——不需要调工具，只需要 LLM 的推理能力。
- *   用 Agent 反而可能让 LLM 在规划阶段就去调 read_file，浪费 token 和时间。
+ * 将自然语言任务转换成结构化 ExecutionPlan。规划阶段只调用模型，不暴露工具，
+ * 避免尚未形成依赖图时提前执行操作。
  */
 public class Planner {
 
     /**
-     * 规划用的 system prompt。
-     *
-     * 关键设计：
-     *   - 明确角色：你是规划专家，不是执行者
-     *   - 明确输出格式：纯 JSON 数组，每个元素有 id/description/dependencies
-     *   - 给出例子：LLM 看到例子比看到抽象说明更准确
-     *   - 约束：id 格式 "task_N"，description 用中文且具体，依赖只能引用已存在的 task id
-     *   - 边界：默认不超过 8 个步骤；简单任务 1-3 个即可
+     * 规划 Prompt：限定模型只输出带 ID、描述和依赖的 JSON 数组，
+     * 并控制步骤数量及依赖引用范围。
      */
     public static final String PLANNER_SYSTEM_PROMPT = """
             你是一个任务规划专家。你的职责是把用户的复杂需求拆解成清晰的、可执行的步骤列表。
@@ -80,14 +66,14 @@ public class Planner {
      * @return 构建好的 ExecutionPlan
      */
     public ExecutionPlan plan(String userRequest) throws Exception {
-        // Step 1: 构造规划请求
+        // 步骤 1：构造不带工具定义的规划请求。
         // 只有 system + user 两条消息，不带工具——规划不需要调工具
         List<Message> messages = List.of(
                 new Message("system", PLANNER_SYSTEM_PROMPT),
                 new Message("user", "请为以下任务生成执行计划：\n\n" + userRequest)
         );
 
-        // Step 2: 调 LLM（不带 tools）
+        // 步骤 2：请求模型生成计划。
         Message reply = llmClient.chatRaw(messages, null);
         String rawJson = reply.content;
 
@@ -95,10 +81,10 @@ public class Planner {
             throw new RuntimeException("LLM 未返回有效的规划结果");
         }
 
-        // Step 3: 清洗 JSON——LLM 经常在 JSON 外面包 markdown 代码块
+        // 步骤 3：去除模型可能添加的 Markdown 代码块等包装。
         String json = extractJson(rawJson);
 
-        // Step 4: 解析 JSON
+        // 步骤 4：解析任务数组。
         List<Map<String, Object>> taskList;
         try {
             taskList = objectMapper.readValue(
@@ -109,7 +95,7 @@ public class Planner {
                     "规划结果解析失败。LLM 返回:\n" + rawJson + "\n\n清洗后:\n" + json, e);
         }
 
-        // Step 5: 构建 ExecutionPlan
+        // 步骤 5：构建任务图。
         ExecutionPlan plan = new ExecutionPlan();
         for (Map<String, Object> item : taskList) {
             String id = (String) item.get("id");
@@ -122,7 +108,7 @@ public class Planner {
             plan.addTask(task);
         }
 
-        // Step 6: 基本校验
+        // 步骤 6：拒绝空计划。
         if (plan.size() == 0) {
             throw new RuntimeException("规划结果为空");
         }
@@ -131,21 +117,13 @@ public class Planner {
     }
 
     /**
-     * 从 LLM 原始回复中提取纯 JSON 数组，并修复常见格式错误。
-     *
-     * LLM 常见毛病：
-     *   1. JSON 外面包 markdown 代码块 ```json ... ```
-     *   2. JSON 前面有"以下是执行计划"之类的废话
-     *   3. 字符串内包含未转义的双引号（中文引号尤其常见）
-     *
-     * 修复策略：
-     *   先清洗外层（去 markdown、定位数组起止），
-     *   再尝试修复 value 内未转义的双引号。
+     * 从模型回复中定位 JSON 数组，移除 Markdown 包装，并修复字符串值内常见的
+     * 未转义双引号。
      */
     public static String extractJson(String raw) {
         String s = raw.strip();
 
-        // ---- 1. 去掉 markdown 代码块标记 ----
+        // 1. 移除 Markdown 代码块标记。
         if (s.startsWith("```")) {
             int start = s.indexOf('\n');
             start = (start == -1) ? 3 : start + 1;
@@ -153,14 +131,14 @@ public class Planner {
             s = (end > start) ? s.substring(start, end) : s.substring(start);
         }
 
-        // ---- 2. 定位 JSON 数组的 [ ... ] ----
+        // 2. 定位 JSON 数组边界。
         int arrayStart = s.indexOf('[');
         int arrayEnd = s.lastIndexOf(']');
         if (arrayStart >= 0 && arrayEnd > arrayStart) {
             s = s.substring(arrayStart, arrayEnd + 1);
         }
 
-        // ---- 3. 修复 value 内未转义的双引号 ----
+        // 3. 修复字符串值内未转义的双引号。
         // LLM 输出形如 "description": "包含打印"Hello"的代码"
         // 其中 "Hello" 的引号没转义，导致解析崩溃。
         // 这里的思路：逐字符扫描，跟踪当前是否在 JSON 字符串 value 内部；

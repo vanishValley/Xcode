@@ -1,8 +1,9 @@
-package com.xu.mcp;
+package com.xu.mcp.transport;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.xu.mcp.McpTransport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -10,6 +11,7 @@ import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
 import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.io.Writer;
@@ -27,28 +29,30 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 通过子进程 stdin/stdout 发送 JSON-RPC 2.0 请求。
- * MCP 语义由上层客户端处理，这里只负责进程、请求 ID、响应匹配和超时。
+ * 基于子进程 stdin/stdout 的 MCP 传输。
+ *
+ * <p>一个后台线程顺序读取 stdout，再按 JSON-RPC request id 把响应分发给
+ * 不同调用线程；stdin 写入使用同步锁，防止并发请求的 JSON 文本互相穿插。</p>
  */
-public final class StdioJsonRpcClient implements AutoCloseable {
+public final class StdioMcpTransport implements McpTransport {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Logger LOG =
-            LoggerFactory.getLogger(StdioJsonRpcClient.class);
+            LoggerFactory.getLogger(StdioMcpTransport.class);
 
     private final Process process;
     private final BufferedReader stdout;
     private final BufferedWriter stdin;
     private final AtomicLong requestIds = new AtomicLong(1);
-    // reader 线程通过 id 找到正在等待该响应的调用线程。
     private final Map<Long, CompletableFuture<JsonNode>> pending =
             new ConcurrentHashMap<>();
     private volatile boolean closed;
     private boolean closeStarted;
 
-    public StdioJsonRpcClient(List<String> command,
-                              Map<String, String> environment,
-                              Path workingDirectory) throws IOException {
+    public StdioMcpTransport(
+            List<String> command,
+            Map<String, String> environment,
+            Path workingDirectory) throws IOException {
         ProcessBuilder builder = new ProcessBuilder(new ArrayList<>(command));
         if (workingDirectory != null) {
             builder.directory(workingDirectory.toFile());
@@ -67,8 +71,8 @@ public final class StdioJsonRpcClient implements AutoCloseable {
         startStderrReader();
     }
 
-    /** 测试用：使用内存 Reader/Writer，不启动真实子进程。 */
-    StdioJsonRpcClient(Reader stdout, Writer stdin) {
+    /** 测试入口：使用内存管道替代真实子进程。 */
+    StdioMcpTransport(Reader stdout, Writer stdin) {
         this.process = null;
         this.stdout = stdout instanceof BufferedReader reader
                 ? reader : new BufferedReader(stdout);
@@ -77,58 +81,61 @@ public final class StdioJsonRpcClient implements AutoCloseable {
         startStdoutReader();
     }
 
+    @Override
     public JsonNode request(String method, JsonNode params, Duration timeout)
             throws IOException {
-        if (closed) throw new IOException("JSON-RPC 客户端已关闭");
+        if (closed) throw new IOException("MCP stdio 传输已关闭");
 
         long id = requestIds.getAndIncrement();
-        ObjectNode message = JSON.createObjectNode();
-        message.put("jsonrpc", "2.0");
+        ObjectNode message = message(method, params);
         message.put("id", id);
-        message.put("method", method);
-        message.set("params", params == null
-                ? JSON.createObjectNode() : params);
 
         CompletableFuture<JsonNode> future = new CompletableFuture<>();
-        // 必须先登记再发送，避免服务端响应太快而找不到对应请求。
+        // 先登记再发送，避免服务端响应太快而找不到等待者。
         pending.put(id, future);
-
         try {
             send(message);
             return future.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
-            throw new IOException("JSON-RPC 请求超时：" + method, e);
-        } catch (InterruptedException e) {
+        } catch (TimeoutException timeoutError) {
+            throw new IOException("MCP 请求超时：" + method, timeoutError);
+        } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            throw new IOException("JSON-RPC 请求被中断：" + method, e);
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof IOException ioe) throw ioe;
-            throw new IOException("JSON-RPC 请求失败：" + method, cause);
+            InterruptedIOException cancelled =
+                    new InterruptedIOException("MCP 请求被中断：" + method);
+            cancelled.initCause(interrupted);
+            throw cancelled;
+        } catch (ExecutionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof IOException io) throw io;
+            throw new IOException("MCP 请求失败：" + method, cause);
         } finally {
             pending.remove(id);
         }
     }
 
+    @Override
     public void notification(String method, JsonNode params)
             throws IOException {
+        send(message(method, params));
+    }
+
+    private static ObjectNode message(String method, JsonNode params) {
         ObjectNode message = JSON.createObjectNode();
         message.put("jsonrpc", "2.0");
         message.put("method", method);
         message.set("params", params == null
                 ? JSON.createObjectNode() : params);
-        send(message);
+        return message;
     }
 
     private synchronized void send(JsonNode message) throws IOException {
-        if (closed) throw new IOException("JSON-RPC 客户端已关闭");
+        if (closed) throw new IOException("MCP stdio 传输已关闭");
         stdin.write(JSON.writeValueAsString(message));
         stdin.newLine();
         stdin.flush();
     }
 
     private void startStdoutReader() {
-        // stdout 只能由一个线程顺序读取，再按 id 分发给不同请求。
         Thread thread = new Thread(() -> {
             try {
                 String line;
@@ -137,17 +144,11 @@ public final class StdioJsonRpcClient implements AutoCloseable {
                         handleMessage(JSON.readTree(line));
                     }
                 }
-                if (!closed) {
-                    closed = true;
-                    failPending(new IOException("MCP 子进程已退出"));
-                }
-            } catch (Exception e) {
-                if (!closed) {
-                    closed = true;
-                    failPending(e);
-                }
+                failIfUnexpectedClose(new IOException("MCP 子进程已退出"));
+            } catch (Exception error) {
+                failIfUnexpectedClose(error);
             }
-        }, "mcp-stdout");
+        }, "mcp-stdio-stdout");
         thread.setDaemon(true);
         thread.start();
     }
@@ -162,32 +163,46 @@ public final class StdioJsonRpcClient implements AutoCloseable {
                     LOG.debug("MCP: {}", line);
                 }
             } catch (IOException ignored) {
+                // close() 关闭流时会结束该线程，无需额外处理。
             }
-        }, "mcp-stderr");
+        }, "mcp-stdio-stderr");
         thread.setDaemon(true);
         thread.start();
     }
 
     private void handleMessage(JsonNode message) {
         JsonNode id = message.get("id");
-        if (id == null || id.isNull()) return; // 服务端通知，当前最小客户端不消费。
+        if (id == null || id.isNull()) {
+            return; // 当前客户端暂不消费服务端主动通知。
+        }
 
         CompletableFuture<JsonNode> future = pending.remove(id.asLong());
         if (future == null) return;
 
         JsonNode error = message.get("error");
         if (error != null && !error.isNull()) {
-            future.completeExceptionally(new IOException(
-                    "JSON-RPC 错误 " + error.path("code").asInt(-1)
-                            + "：" + error.path("message").asText("unknown")));
+            future.completeExceptionally(jsonRpcError(error));
         } else {
             future.complete(message.path("result"));
         }
     }
 
+    private static IOException jsonRpcError(JsonNode error) {
+        return new IOException(
+                "JSON-RPC 错误 " + error.path("code").asInt(-1)
+                        + "：" + error.path("message").asText("unknown"));
+    }
+
+    private void failIfUnexpectedClose(Throwable cause) {
+        if (!closed) {
+            closed = true;
+            failPending(cause);
+        }
+    }
+
     private void failPending(Throwable cause) {
-        IOException failure = cause instanceof IOException ioe
-                ? ioe : new IOException("MCP 连接已断开", cause);
+        IOException failure = cause instanceof IOException io
+                ? io : new IOException("MCP 连接已断开", cause);
         pending.values().forEach(
                 future -> future.completeExceptionally(failure));
         pending.clear();
@@ -216,12 +231,12 @@ public final class StdioJsonRpcClient implements AutoCloseable {
                         process.destroyForcibly();
                     }
                 }
-            } catch (InterruptedException e) {
+            } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 process.destroyForcibly();
             }
         }
 
-        failPending(new IOException("JSON-RPC 客户端已关闭"));
+        failPending(new IOException("MCP stdio 传输已关闭"));
     }
 }

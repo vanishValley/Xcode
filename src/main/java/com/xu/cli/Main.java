@@ -7,7 +7,11 @@ import com.xu.hitl.HitlHandler;
 import com.xu.hitl.HitlToolRegistry;
 import com.xu.hitl.TerminalHitlHandler;
 import com.xu.llm.LlmClient;
-import com.xu.mcp.ChromeMcpClient;
+import com.xu.mcp.LazyMcpClient;
+import com.xu.mcp.McpClient;
+import com.xu.mcp.McpTransport;
+import com.xu.mcp.transport.StdioMcpTransport;
+import com.xu.mcp.transport.StreamableHttpMcpTransport;
 import com.xu.memory.LongTermMemory;
 import com.xu.memory.MemoryManager;
 import com.xu.memory.SessionStore;
@@ -19,6 +23,7 @@ import com.xu.tool.impl.ExecuteCommandTool;
 import com.xu.tool.impl.GlobFilesTool;
 import com.xu.tool.impl.ListDirTool;
 import com.xu.tool.impl.ReadFileTool;
+import com.xu.tool.impl.StartMcpTool;
 import com.xu.tool.impl.WebFetchTool;
 import com.xu.tool.impl.WebSearchTool;
 import com.xu.tool.impl.WriteFileTool;
@@ -41,13 +46,23 @@ import java.io.PrintWriter;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.Set;
 
-/** Process bootstrap and UI mode selection. */
+/** 应用组合根：负责进程启动、依赖装配和交互模式选择。 */
 public final class Main {
+
+    private static final Set<String> CHROME_MCP_TOOLS = Set.of(
+            "navigate_page", "take_snapshot", "wait_for",
+            "list_pages", "new_page", "select_page",
+            "click", "fill", "fill_form", "take_screenshot");
+    private static final Set<String> DEEPWIKI_MCP_TOOLS = Set.of(
+            "read_wiki_structure", "read_wiki_contents", "ask_question");
 
     private Main() {
     }
@@ -74,7 +89,8 @@ public final class Main {
             return;
         }
 
-        try (Tracing tracing = Tracing.create()) {
+        try (Tracing tracing = Tracing.create(
+                paths.projectDataDir().resolve("observability"))) {
             run(args, tracing, paths, env);
         }
     }
@@ -88,9 +104,8 @@ public final class Main {
             runOnce(args, tracing, paths, env);
         } catch (TuiInitializationException error) {
             /*
-             * No user task has started yet: all runtime resources from the
-             * failed rich-mode attempt have already been closed by runOnce,
-             * so rebuilding a plain stack cannot duplicate side effects.
+             * 此时用户任务尚未开始，失败的富终端运行时也已关闭；
+             * 重新装配 plain 模式不会重复产生业务副作用。
              */
             logger().atWarn()
                     .addKeyValue("event", "tui.application_initialize_failed")
@@ -164,7 +179,7 @@ public final class Main {
         CancellationToken cancellation = new CancellationToken();
         LlmClient client = new LlmClient(apiKey, model, tracing);
         HitlToolRegistry registry =
-                new HitlToolRegistry(hitl, cancellation);
+                new HitlToolRegistry(hitl, cancellation, tracing);
         registry.setEnabled(configFlag(env, "HITL_ENABLED", true));
         registry.register(new ReadFileTool());
         registry.register(new WriteFileTool(paths.projectRoot()));
@@ -200,7 +215,11 @@ public final class Main {
         }
         registry.register(new WebFetchTool());
 
-        ChromeMcpClient chromeMcp = startChromeMcp(
+        /*
+         * 启动阶段只注册轻量的 start_* 工具，不进行 npx 启动或远程 HTTP
+         * 握手。第一次真正需要 MCP 时，再由 LazyMcpClient 完成初始化。
+         */
+        List<LazyMcpClient> mcpClients = registerMcpClients(
                 registry, env, paths.projectRoot(), tracing, events);
         try {
             Agent agent = new Agent(
@@ -280,7 +299,7 @@ public final class Main {
                             Runtime.getRuntime().removeShutdownHook(
                                     shutdownHook);
                         } catch (IllegalStateException ignored) {
-                            // JVM shutdown is already running this hook.
+                            // JVM 正在执行此关闭钩子，无需再次移除。
                         }
                     }
                 }
@@ -294,8 +313,9 @@ public final class Main {
                 }
             }
         } finally {
-            if (chromeMcp != null) {
-                chromeMcp.close();
+            // 逆序关闭，和资源创建顺序保持对称；未启动的懒加载器关闭成本为零。
+            for (int i = mcpClients.size() - 1; i >= 0; i--) {
+                mcpClients.get(i).close();
             }
         }
         } finally {
@@ -318,33 +338,108 @@ public final class Main {
         }
     }
 
-    private static ChromeMcpClient startChromeMcp(
+    /**
+     * 装配 MCP Server，但不连接它们。
+     *
+     * <p>Main 是组合根：在这里决定每个服务端使用哪种 Transport、暴露哪些
+     * 工具以及是否串行执行。协议和懒加载实现仍保持完全通用。</p>
+     */
+    private static List<LazyMcpClient> registerMcpClients(
             HitlToolRegistry registry,
             Map<String, String> env,
             Path projectRoot,
             Tracing tracing,
             UiEventSink events) {
-        if (!configFlag(env, "CHROME_MCP_ENABLED", true)) {
-            return null;
-        }
-        try {
-            ChromeMcpClient client = ChromeMcpClient.start(
-                    registry, env, projectRoot, tracing);
+        List<LazyMcpClient> clients = new ArrayList<>();
+
+        if (configFlag(env, "CHROME_MCP_ENABLED", true)) {
+            LazyMcpClient chrome = new LazyMcpClient(() -> {
+                McpTransport transport = new StdioMcpTransport(
+                        chromeCommand(env),
+                        chromeChildEnvironment(),
+                        projectRoot);
+                return McpClient.connect(
+                        "chrome-devtools",
+                        "Chrome DevTools",
+                        transport,
+                        CHROME_MCP_TOOLS,
+                        true,
+                        registry,
+                        tracing);
+            });
+            registry.register(new StartMcpTool(
+                    "start_chrome_mcp",
+                    "按需启动 Chrome DevTools MCP 并动态注册浏览器工具。"
+                            + "仅在 web_fetch 返回 browser_required，或任务需要"
+                            + "操作动态网页、登录态、点击和表单时调用。重复调用会复用同一实例。",
+                    chrome));
+            clients.add(chrome);
             events.emit(new UiEvent.Notice(
-                    UiEvent.Severity.SUCCESS,
-                    "Chrome DevTools MCP 已连接，注册 "
-                            + client.registeredToolCount() + " 个工具。"));
-            return client;
-        } catch (IOException error) {
-            events.emit(new UiEvent.Notice(
-                    UiEvent.Severity.WARNING,
-                    "Chrome DevTools MCP 不可用；本地工具不受影响。"));
-            logger().atWarn()
-                    .addKeyValue("event", "mcp.chrome.start_failed")
-                    .setCause(error)
-                    .log("Chrome MCP 启动失败");
-            return null;
+                    UiEvent.Severity.INFO,
+                    "Chrome DevTools MCP 已启用懒加载。"));
         }
+
+        if (configFlag(env, "DEEPWIKI_MCP_ENABLED", true)) {
+            String endpoint = configValue(
+                    env,
+                    "DEEPWIKI_MCP_URL",
+                    "https://mcp.deepwiki.com/mcp");
+            LazyMcpClient deepWiki = new LazyMcpClient(() -> {
+                McpTransport transport =
+                        new StreamableHttpMcpTransport(endpoint, Map.of());
+                return McpClient.connect(
+                        "deepwiki",
+                        "DeepWiki",
+                        transport,
+                        DEEPWIKI_MCP_TOOLS,
+                        false,
+                        registry,
+                        tracing);
+            });
+            registry.register(new StartMcpTool(
+                    "start_deepwiki_mcp",
+                    "按需连接 DeepWiki 远程 MCP，并动态注册公开 GitHub 仓库"
+                            + "结构、文档和问答工具。分析公开仓库实现时调用；"
+                            + "它不需要 API Key，重复调用会复用同一实例。",
+                    deepWiki));
+            clients.add(deepWiki);
+            events.emit(new UiEvent.Notice(
+                    UiEvent.Severity.INFO,
+                    "DeepWiki 远程 MCP 已启用懒加载。"));
+        }
+        return clients;
+    }
+
+    /** Chrome MCP 的本地进程启动命令；协议逻辑不在这里。 */
+    private static List<String> chromeCommand(Map<String, String> env) {
+        List<String> command = new ArrayList<>();
+        if (System.getProperty("os.name", "")
+                .toLowerCase(Locale.ROOT).contains("win")) {
+            command.add("cmd.exe");
+            command.add("/c");
+        }
+        command.add("npx");
+        command.add("-y");
+        command.add(configValue(
+                env,
+                "CHROME_MCP_PACKAGE",
+                "chrome-devtools-mcp@1.6.0"));
+        command.add("--isolated=true");
+        if (configFlag(env, "CHROME_MCP_HEADLESS", true)) {
+            command.add("--headless=true");
+        }
+        command.add("--no-usage-statistics");
+        return command;
+    }
+
+    /** 关闭 Chrome MCP 自更新和遥测，并把 npm 缓存放到临时目录。 */
+    private static Map<String, String> chromeChildEnvironment() {
+        return Map.of(
+                "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS", "1",
+                "CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS", "1",
+                "npm_config_cache", Path.of(
+                        System.getProperty("java.io.tmpdir"),
+                        "xcode-npm-cache").toString());
     }
 
     private static Terminal openTerminal(RequestedUi requested) {

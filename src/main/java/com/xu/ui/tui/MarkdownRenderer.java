@@ -8,10 +8,7 @@ import org.jline.utils.AttributedStyle;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Small terminal Markdown renderer. It intentionally supports only the
- * constructs that improve coding-agent readability and never evaluates ANSI.
- */
+/** 轻量终端 Markdown 渲染器，只支持有助于阅读的语法，并且从不解释 ANSI。 */
 final class MarkdownRenderer {
 
     List<AttributedString> render(String markdown) {

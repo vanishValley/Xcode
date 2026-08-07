@@ -11,26 +11,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Memory 系统门面 —— Agent 通过这一个类操作整个记忆系统。
+ * 记忆系统门面，统一协调会话持久化、长期记忆、Token 预算和对话压缩。
  *
- * 内部组件:
- *   SessionStore          — 会话持久化(对话历史)
- *   LongTermMemory        — 长期知识(存储 + 检索 + 写入治理)
- *   TokenBudget           — Token 估算
- *   ConversationCompactor — 对话压缩
- *
- * Agent 每次任务调用:
- *   beginTask(query)         → 冻结本次 ReAct 任务的长期记忆
- *
- * Agent 每个工具轮次调用:
- *   compactIfNeeded(history) → 检查并原地压缩历史
- *   assemblePrompt(history)  → 组装本轮 prompt,返回新 List
- *
- * Agent 任务结束调用:
- *   persist(history)         → 保存干净历史到磁盘
- *
- * 注入块不进干净历史 → session 落盘不被污染 → 不再需要 removeIf 擦除。
- * 任务状态(setGoal/setContext)存在 MemoryManager,每轮 assemblePrompt 自动重贴。
+ * <p>目标、Plan 上下文和任务级长期记忆只在组装 Prompt 时临时注入，
+ * 不写入原始会话历史；同一 ReAct 任务中的长期记忆只检索一次并保持冻结。</p>
  */
 public class MemoryManager {
 
@@ -47,7 +31,7 @@ public class MemoryManager {
     private final String projectPath;
     private int totalTurns = 0;
 
-    /** 任务状态:目标锚点(每轮重贴防偏移) + 外部上下文(Main 回灌的 plan 报告) */
+    /** 每轮重新注入的目标锚点和 Plan 上下文，防止任务方向随长对话偏移。 */
     private String taskGoal;
     private String taskContext;
     /** 一次 ReAct 任务开始时检索，任务内所有工具轮次复用同一份。 */
@@ -74,7 +58,7 @@ public class MemoryManager {
         this.projectPath = null;
     }
 
-    /** 子 Agent 用的构造:共享长期知识检索 + 目标锚点,无会话落盘/压缩(子任务历史短) */
+    /** 子 Agent 使用：共享长期记忆，但不持久化和压缩短期会话。 */
     public MemoryManager(
             LongTermMemory longTermMemory,
             String projectPath) {
@@ -97,7 +81,7 @@ public class MemoryManager {
         this.frozenMemories = List.of();
     }
 
-    // ────── 每轮统一组装(收敛散落注入,不污染干净历史) ──────
+    // ────── Prompt 组装 ──────
 
     /**
      * 开始一次用户任务。长期记忆只在这里检索一次，后续 ReAct 工具轮次保持不变。
@@ -130,8 +114,7 @@ public class MemoryManager {
     }
 
     /**
-     * 从干净历史 + 注入块组装本轮 prompt,返回新 List。
-     * 注入块不进干净历史 → session 落盘不被污染 → 不再需要 removeIf 擦除。
+     * 从原始历史和临时上下文组装本轮 Prompt，并返回新的列表。
      *
      * <p>固定顺序：基础 system + Skill 索引 → 目标锚点 → 冻结长期记忆
      * → Plan 上下文 → 原始 user/assistant/tool 历史。
@@ -182,7 +165,7 @@ public class MemoryManager {
     }
 
     /**
-     * 检查是否需要压缩,需要则就地压缩 history。
+     * 检查 Token 预算，必要时就地压缩历史。
      * @return 压缩后的消息列表（可能和输入是同一个引用）
      */
     public List<Message> compactIfNeeded(List<Message> history) {
@@ -201,14 +184,14 @@ public class MemoryManager {
         }
     }
 
-    // ────── 长期知识 CRUD（Main 的命令直接调） ──────
+    // ────── 长期记忆管理 ──────
 
-    /** 手动 /save:默认 PROJECT 作用域、HUMAN 来源。 */
+    /** 手动保存项目级人工记忆。 */
     public LongTermMemory.SaveResult saveFact(String content) {
         return saveFact(content, MemoryScope.PROJECT);
     }
 
-    /** 手动 /save,指定作用域(PROJECT / GLOBAL)。返回治理门决策;子 Agent 返回 null。 */
+    /** 按指定作用域保存人工记忆；未配置长期记忆的子 Agent 返回 {@code null}。 */
     public LongTermMemory.SaveResult saveFact(
             String content,
             MemoryScope scope) {
@@ -227,7 +210,7 @@ public class MemoryManager {
                 : List.of();
     }
 
-    /** 治理门挂起、等人工确认的候选(AGENT 自动沉淀接上后才会有内容)。 */
+    /** 返回低置信度、等待人工确认的 Agent 记忆候选。 */
     public List<MemoryRecord> pendingReview() {
         return longTermMemory != null
                 ? longTermMemory.pendingReview()
@@ -240,7 +223,7 @@ public class MemoryManager {
 
     // ────── 自动沉淀 ──────
 
-    /** 事后扫 transcript,有"失败→修正→成功"则提炼入库。best-effort,失败静默。 */
+    /** 尽力从“失败→修正→成功”的执行记录中提炼经验；失败不影响主流程。 */
     public void tryAutoExtract(List<Message> history, LlmClient llmClient) {
         if (longTermMemory == null || projectPath == null) return;
         LessonExtractor.tryExtract(

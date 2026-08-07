@@ -87,7 +87,7 @@ class WriteFileToolTest {
     void shouldRejectOversizedContent() throws Exception {
         WriteFileTool tool = new WriteFileTool(tempDir);
 
-        String big = "A".repeat(6 * 1024 * 1024); // ~6MB
+        String big = "A".repeat(6 * 1024 * 1024); // 约 6 MB，超过工具上限。
         String result = tool.execute(Map.of(
                 "path", "big.txt",
                 "content", big

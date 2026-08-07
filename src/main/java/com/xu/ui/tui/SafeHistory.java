@@ -8,12 +8,10 @@ import java.nio.file.Path;
 import java.time.Instant;
 
 /**
- * JLine history that refuses to retain values recognized as credentials.
+ * 拒绝保存疑似凭据的 JLine 历史。
  *
- * <p>This boundary is intentionally stricter than display redaction: replacing
- * a credential would create a misleading command, so the entire entry is
- * omitted. Existing sensitive lines are filtered while loading and the file is
- * rewritten immediately.</p>
+ * <p>历史边界比显示脱敏更严格：替换凭据会得到含义错误的命令，因此直接丢弃整条记录。
+ * 加载时也会过滤旧的敏感行，并立即重写历史文件。</p>
  */
 final class SafeHistory extends DefaultHistory {
 

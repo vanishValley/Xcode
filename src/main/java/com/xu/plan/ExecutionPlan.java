@@ -194,20 +194,8 @@ public class ExecutionPlan {
     // ──────── 图完整性检测 ────────
 
     /**
-     * 检测计划中是否存在循环依赖。
-     *
-     * 算法：DFS + visited + recStack
-     *   visited[id] = true  → 该节点曾经访问过（不必再走）
-     *   recStack[id] = true  → 该节点还在当前 DFS 路径上
-     *   在 DFS 过程中，如果遇到 recStack 中的节点 → 说明有一条路绕回了自己 → 有环
-     *
-     * 面试讲法：
-     *   "用两个 Set，一个存所有访问过的节点，一个存当前路径上的节点。
-     *    沿着依赖边走，如果走到的节点已经在当前路径上了，就是环。
-     *    回溯的时候从路径里移除。时间复杂度 O(V+E)。"
-     *
-     * 为什么不用三色 DFS？
-     *   visited + recStack 是面试标准写法，两个布尔数组直观无歧义。
+     * 使用 DFS 检测循环依赖。{@code visited} 记录已检查节点，{@code recStack}
+     * 记录当前递归路径；再次遇到路径内节点即存在回边。时间复杂度为 O(V+E)。
      */
     public boolean hasCycle() {
         Set<String> visited = new HashSet<>();

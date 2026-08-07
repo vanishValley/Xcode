@@ -7,21 +7,21 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Reviewer 的输出,从 LLM 返回的 JSON 解析而来。
+ * 从 Reviewer 的 JSON 回复解析出的结构化审查结果。
  *
- * 防御策略:LLM 输出不稳定,解析层做容错——
+ * 解析层兼容以下模型输出差异：
  *   - issues/suggestions 字段可能是数组、可能是单字符串、可能不存在
- *   - JSON 解析失败 → 默认通过(审察者自己挂了,不阻塞业务)
- *   - approved 字段缺失 → 默认通过(同上)
+ *   - JSON 解析失败时宽容放行，避免审查器故障阻塞主流程
+ *   - approved 字段缺失时按通过处理
  */
 public record ReviewResult(boolean approved, List<String> issues, List<String> suggestions) {
 
     private static final ObjectMapper mapper = new ObjectMapper();
 
-    /** 从 LLM 返回文本解析,内置两层 fallback。 */
+    /** 从模型文本解析审查结果，格式异常时使用宽容降级策略。 */
     public static ReviewResult parse(String llmOutput) {
         try {
-            // 只去 markdown 包裹,不做数组提取(Reviewer 输出的是 JSON 对象,不是数组)
+            // 只移除 Markdown 包装；Reviewer 协议要求返回 JSON 对象而不是数组。
             String json = llmOutput.strip();
             if (json.startsWith("```")) {
                 int start = json.indexOf('\n');

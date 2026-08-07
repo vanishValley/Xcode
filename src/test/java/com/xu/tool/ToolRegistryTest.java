@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -63,6 +64,19 @@ class ToolRegistryTest {
         assertTrue(registry.isEmpty());
         assertEquals(0, registry.names().size());
         assertTrue(registry.toOpenAiTools().isEmpty());
+    }
+
+    @Test
+    void shouldBatchRegisterAndReturnIndependentNameSnapshot() {
+        Set<String> before = registry.names();
+        registry.registerAll(List.of(
+                dummyTool("mcp__demo__one", "one"),
+                dummyTool("mcp__demo__two", "two")));
+
+        assertTrue(before.isEmpty());
+        assertEquals(
+                List.of("mcp__demo__one", "mcp__demo__two"),
+                List.copyOf(registry.names()));
     }
 
     // ---- 辅助：创建一个最小实现的 Tool ----

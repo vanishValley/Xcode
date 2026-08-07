@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 
+/** 读取当前项目中的文本文件，并拒绝超过 100 KB 的内容。 */
 public class ReadFileTool implements Tool {
 
     @Override

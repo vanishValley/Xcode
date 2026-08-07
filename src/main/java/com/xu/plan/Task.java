@@ -44,7 +44,7 @@ public class Task {
         this.result = "";
     }
 
-    // ---- getter / setter ----
+    // 访问器
 
     public String getId() { return id; }
     public String getDescription() { return description; }

@@ -13,9 +13,27 @@ public class ToolRegistry {
 
     private final Map<String, Tool> tools = new LinkedHashMap<>();
 
-    /** 注册一个工具 */
-    public void register(Tool tool) {
+    /**
+     * 注册一个工具。
+     *
+     * <p>MCP 懒加载后注册表会在 Agent 运行期间发生写入，因此所有读写都使用
+     * 同一把对象锁，保证 LinkedHashMap 的结构和内存可见性。</p>
+     */
+    public synchronized void register(Tool tool) {
         tools.put(tool.name(), tool);
+    }
+
+    /**
+     * 原子注册一批工具。
+     *
+     * <p>其他线程只能看到注册前或注册后的完整集合，不会看到 tools/list
+     * 只发布了一半的中间状态。慢速 MCP 握手不在本锁内执行。</p>
+     */
+    public synchronized void registerAll(
+            Collection<? extends Tool> newTools) {
+        for (Tool tool : newTools) {
+            tools.put(tool.name(), tool);
+        }
     }
 
     /**
@@ -26,7 +44,7 @@ public class ToolRegistry {
      * “索引常驻 prompt、正文按需加载”也比把所有 Skill 全塞进 system prompt 更省 token。
      */
     public void registerLoadSkillTool(com.xu.skill.SkillRegistry skillRegistry) {
-        tools.put("load_skill", new Tool() {
+        register(new Tool() {
             @Override
             public String name() { return "load_skill"; }
 
@@ -77,17 +95,17 @@ public class ToolRegistry {
     }
 
     /** 根据名称找工具 */
-    public Tool get(String name) {
+    public synchronized Tool get(String name) {
         return tools.get(name);
     }
 
-    /** 所有已注册的工具名 */
-    public Set<String> names() {
-        return tools.keySet();
+    /** 所有已注册的工具名；返回快照，避免把 Map 的实时视图暴露给调用方。 */
+    public synchronized Set<String> names() {
+        return new LinkedHashSet<>(tools.keySet());
     }
 
     /** 是否为空 */
-    public boolean isEmpty() {
+    public synchronized boolean isEmpty() {
         return tools.isEmpty();
     }
 
@@ -96,8 +114,14 @@ public class ToolRegistry {
      * 这个 JSON 会跟在 messages 后面发给 LLM，告诉它"你可以用这些工具"。
      */
     public List<Map<String, Object>> toOpenAiTools() {
+        List<Tool> snapshot;
+        synchronized (this) {
+            snapshot = new ArrayList<>(tools.values());
+        }
+
+        // Tool 元数据转换不占用注册表锁，动态注册只在复制快照时短暂等待。
         List<Map<String, Object>> result = new ArrayList<>();
-        for (Tool tool : tools.values()) {
+        for (Tool tool : snapshot) {
             Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("type", "function");
             entry.put("function", Map.of(

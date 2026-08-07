@@ -19,12 +19,7 @@ import java.util.Map;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
-/**
- * The only component allowed to write the rich terminal.
- *
- * <p>It keeps durable information in scrollback and transient activity in the
- * bottom status line.</p>
- */
+/** 富终端的唯一写入者：持久信息写入回滚区，瞬时活动显示在底部状态栏。 */
 final class TuiRenderer implements AutoCloseable {
 
     private static final String[] SPINNER =

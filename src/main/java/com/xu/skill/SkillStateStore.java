@@ -12,14 +12,8 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 仅持久化 disabled 列表({name → true})。
- *
- * 为什么不是 enabled 列表?
- *   新增 Skill 时默认为启用 —— 如果持久化 enabled 列表, 新 skill 会被遗漏。
- *   只记录"用户主动关了哪些" —— 没记录的都默认启用。
- *
- * 文件: ~/.xcode/skills.json  →  {"disabled": ["foo", "bar"]}
- * 文件不存在 → 所有 skill 默认启用。
+ * 将用户明确禁用的 Skill 保存到 {@code ~/.xcode/skills.json}。
+ * 只记录禁用项，使后续新增的 Skill 默认保持启用。
  */
 public class SkillStateStore {
 

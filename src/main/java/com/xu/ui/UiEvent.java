@@ -9,12 +9,10 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Core-to-UI event contract.
+ * 核心运行时到界面层的事件协议。
  *
- * <p>Agent, Plan, Tool and HITL code only publish immutable events. They never
- * write to the terminal directly. This keeps terminal ownership in one place
- * and makes the same runtime usable from the rich TUI, the plain CLI and
- * tests.</p>
+ * <p>Agent、Plan、Tool 和 HITL 只发布不可变事件，不直接写终端。终端输出由界面层统一持有，
+ * 因而同一运行时可复用于 TUI、plain CLI 和测试。</p>
  */
 public sealed interface UiEvent permits
         UiEvent.Notice,
@@ -202,8 +200,7 @@ public sealed interface UiEvent permits
     }
 
     /**
-     * A synchronous HITL bridge: the worker publishes this event and waits on
-     * {@code response}; the UI thread renders the prompt and completes it.
+     * 同步 HITL 桥接事件：Worker 发布后等待 {@code response}，UI 线程展示审批并完成它。
      */
     record ApprovalRequested(
             long requestId,

@@ -11,32 +11,27 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 
 /**
- * 统一管理 Xcode 所有路径 —— 替代原来散落在 SessionStore / LongTermMemory / PlanStore / Main
- * 四处的路径计算逻辑。
+ * 统一计算用户级和项目级路径。
  *
- * 两层目录:
- *   ~/.xcode/                    ← 用户级: 跨所有项目的数据、配置、日志
- *     projects/<name@hash>/      ← 项目数据: 会话、记忆、checkpoint、日志(按项目隔离)
- *       logs/                    ← 当前项目的运行日志和滚动归档
- *     skills/                    ← 用户级 Skill 覆盖
+ * <pre>
+ * ~/.xcode/projects/&lt;name@hash&gt;/  会话、记忆、检查点和日志
+ * ~/.xcode/skills/                 用户级 Skill
+ * &lt;project&gt;/.xcode/skills/        项目级 Skill
+ * </pre>
  *
- *  <project>/.xcode/            ← 项目级: 可入 git 的团队共享配置
- *     skills/                    ← 项目级 Skill 覆盖(最高优先级)
- *
- * 项目 key: SHA-256(标准化路径) 截取前 16 位十六进制(64-bit)
- *   替代旧 String.hashCode() 的 32 位弱哈希,消除碰撞风险。
+ * <p>项目标识取标准化绝对路径 SHA-256 的前 16 位，避免不同同名目录共享运行数据。</p>
  */
 public class XcodePaths {
 
     private final Path projectRoot;     // 标准化后的项目根
-    private final String projectKey;    // SHA-256 前 8 位
+    private final String projectKey;    // SHA-256 前 16 位
     private final String projectName;   // 项目根目录名
 
     public XcodePaths(Path projectRoot) {
-        // ① 标准化: 去 ../、统一分隔符、解析符号链接
+        // 标准化路径，消除相对段并尽量解析符号链接。
         this.projectRoot = normalize(projectRoot);
         this.projectName = this.projectRoot.getFileName().toString();
-        this.projectKey = sha256hex(this.projectRoot.toString()).substring(0, 16);  // 64-bit, 消除碰撞
+        this.projectKey = sha256hex(this.projectRoot.toString()).substring(0, 16);
     }
 
     // ── 用户级目录 ──
@@ -68,12 +63,12 @@ public class XcodePaths {
 
     // ── 项目级目录 ──
 
-    /** <project>/.xcode/ — 项目级配置(Skill 覆盖 / 本地配置, 可入 git) */
+    /** {@code <project>/.xcode/}：可纳入版本控制的项目级配置。 */
     public Path projectConfigDir() {
         return projectRoot.resolve(".xcode");
     }
 
-    /** <project>/.xcode/skills/ — 项目级 Skill 覆盖(最高优先级) */
+    /** {@code <project>/.xcode/skills/}：最高优先级的项目级 Skill。 */
     public Path projectSkillsDir() {
         return projectConfigDir().resolve("skills");
     }
@@ -81,8 +76,7 @@ public class XcodePaths {
     // ── 初始化 ──
 
     /**
-     * 首次进入一个项目目录时自动创建 .xcode/skills/ 骨架。
-     * 不报错、不交互 —— 目录空着无所谓, 以后有覆盖文件就生效。
+     * 首次进入项目时创建 {@code .xcode/skills/}；创建失败只记日志，不阻止启动。
      */
     public void initProjectIfNeeded() {
         try {
@@ -139,7 +133,7 @@ public class XcodePaths {
         }
     }
 
-    // ── getter ──
+    // 访问器
 
     public Path projectRoot() { return projectRoot; }
     public String projectKey()  { return projectKey; }

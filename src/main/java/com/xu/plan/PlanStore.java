@@ -12,30 +12,17 @@ import java.nio.file.Path;
 import java.util.*;
 
 /**
- * Plan 执行进度持久化 —— Plan 模式中途进程退出后，重启能从断点续跑。
+ * 持久化 Plan 任务图的执行进度，用于进程重启后的安全恢复。
  *
- * 存的是什么？（关键区别，别和 SessionStore 搞混）
- *   SessionStore 存 List&lt;Message&gt; —— LLM 的"对话流"，恢复后灌回 LLM。
- *   PlanStore   存 ExecutionPlan  —— 任务图的"执行进度"（每个 task 的
- *                id/依赖/状态/结果），恢复后靠 getReadyTasks 从断点继续调度，
- *                不进任何 LLM 上下文。
- *
- * 生命周期：checkpoint 是"在途标记"不是"归档"。
- *   plan 执行期间反复覆盖同一个文件；plan 全部完成(isAllComplete)后必须删除，
- *   否则下次启动会误判"有未完成计划"。
- *
- * 设计要点：
- *   1. 手动序列化(Map)而非 Jackson 注解 —— Task/ExecutionPlan 是充血领域模型
- *      (final 字段 + 大量计算型 getter)，自动序列化会侵入领域类、吐出派生垃圾。
- *   2. 原子写(复用 FileUtils) —— checkpoint 永不半张，崩溃时读到的永远一致。
- *   3. schema 版本号 —— 存 "version"，为将来 Task 加字段留向后兼容余地。
- *   4. 容错 —— load 失败/损坏当"无 checkpoint"处理，绝不让程序起不来。
+ * <p>它与保存 LLM 对话的 SessionStore 相互独立：检查点只记录任务 ID、依赖、状态、
+ * 结果和重规划次数，不注入模型上下文。数据通过显式映射和原子写入保存，并携带结构版本；
+ * 计划确定完成后删除检查点，状态未知的任务则保留供人工核验。</p>
  */
 public class PlanStore {
 
     private static final Logger logger = LoggerFactory.getLogger(PlanStore.class);
 
-    /** 当前 checkpoint schema 版本；字段结构变化时递增 */
+    /** 当前检查点结构版本；持久化字段不兼容时递增。 */
     private static final int SCHEMA_VERSION = 1;
 
     private static final String FILE_NAME = "plan_checkpoint.json";
@@ -53,21 +40,19 @@ public class PlanStore {
         this.checkpointFile = projectDataDir.resolve(FILE_NAME);
     }
 
-    // ────── Checkpoint 数据模型 ──────
+    // ────── 检查点数据模型 ──────
 
     /**
-     * 一次 plan 执行的完整快照 = 任务图 + 会话元数据。
-     * 用 record 组合 ExecutionPlan（复用图、不污染它 —— userRequest/replanCount
-     * 是"执行会话"元数据，不属于任务图本身）。
+     * 一次 Plan 执行的完整快照。用户请求和重规划次数属于执行元数据，
+     * 因此通过 record 与任务图组合，而不写入 ExecutionPlan。
      */
     public record Checkpoint(String userRequest, int replanCount, ExecutionPlan plan) {}
 
     // ────── 存 ──────
 
     /**
-     * 保存 checkpoint（全量原子重写）。
-     * 失败只记录日志、不抛出，并通过返回值交给调用方决定策略。变更型 Worker
-     * 启动前必须检查该返回值并 fail closed；终态更新则可以尽力保存。
+     * 原子重写完整检查点。失败时返回 {@code false}：可变 Worker 启动前必须失败关闭，
+     * 终态更新则由调用方决定是否仅记录日志。
      */
     public boolean save(Checkpoint cp) {
         try {
@@ -100,8 +85,8 @@ public class PlanStore {
     // ────── 读 ──────
 
     /**
-     * 加载 checkpoint。
-     * @return Checkpoint；无文件 / 解析失败 / 损坏都返回 null（当作"无 checkpoint"）
+     * 加载检查点。
+     * @return 无文件或内容损坏时返回 {@code null}
      */
     @SuppressWarnings("unchecked")
     public Checkpoint load() {
@@ -131,9 +116,8 @@ public class PlanStore {
                             + "为避免重复副作用，未自动重试。";
                 } else if (status == Task.Status.IN_PROGRESS) {
                     /*
-                     * The process died after this task was durably marked as
-                     * started. Its side effects are unknown, so silently
-                     * replaying it would be unsafe.
+                     * 任务持久化为“已启动”后进程异常退出，其副作用状态未知，
+                     * 因此恢复时必须失败关闭，不能静默重放。
                      */
                     status = Task.Status.FAILED;
                     result = INTERRUPTED_RESULT_PREFIX
@@ -152,7 +136,7 @@ public class PlanStore {
         }
     }
 
-    /** Parses a persisted status; null means unknown and must fail closed. */
+    /** 解析持久化状态；返回 {@code null} 表示状态未知，调用方必须失败关闭。 */
     private Task.Status parseStatus(Object raw) {
         try {
             return Task.Status.valueOf(String.valueOf(raw));
@@ -177,7 +161,7 @@ public class PlanStore {
         return Files.exists(checkpointFile);
     }
 
-    /** 删除 checkpoint（plan 完成或用户丢弃时调） */
+    /** 在 Plan 确定完成或用户明确丢弃时删除检查点。 */
     public void delete() {
         try {
             Files.deleteIfExists(checkpointFile);

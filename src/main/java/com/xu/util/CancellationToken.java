@@ -4,10 +4,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Shared cancellation state for one foreground Agent or Plan run.
+ * 单次前台 Agent 或 Plan 任务共享的取消状态。
  *
- * <p>Thread interruption alone cannot instantly reach Plan worker threads.
- * Every execution boundary therefore observes this shared token as well.</p>
+ * <p>线程中断无法立即传递到所有 Plan Worker，因此每个执行边界还必须检查此令牌。</p>
  */
 public final class CancellationToken {
 
@@ -41,10 +40,7 @@ public final class CancellationToken {
         boundGeneration.set(generation);
     }
 
-    /**
-     * Binds a reused executor thread to the generation that was just started.
-     * Plan worker threads inherit this value automatically.
-     */
+    /** 将复用的执行器线程绑定到本次 generation；Plan Worker 会自动继承该值。 */
     public void bindCurrentRun() {
         boundGeneration.set(activeGeneration.get());
     }
@@ -60,12 +56,12 @@ public final class CancellationToken {
                 || (parent != null && parent.isCancelled());
     }
 
-    /** Creates an independently cancellable scope linked to this run. */
+    /** 创建与当前任务关联、但可单独取消的子作用域。 */
     public CancellationToken childScope() {
         return new CancellationToken(this);
     }
 
-    /** Prevents a new prompt if an old mutating worker could still be alive. */
+    /** 旧的可变 Worker 可能仍在运行时，禁止接受下一条任务。 */
     public void markUnsafeToReuse() {
         reusable.set(false);
         if (parent != null) {

@@ -10,32 +10,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 对话压缩器 —— Token 超限时调用 LLM 把旧消息压缩成结构化摘要。
+ * Token 超限时将旧对话压缩为结构化摘要。
  *
- * 核心设计决策（面试重点）：
- *
- *   1. 为什么压缩而不截断？
- *      编程 Agent 场景用户的约束可能在 10 轮前提出、20 轮后才用到。
- *      截断直接丢信息，压缩保留语义精华。
- *
- *   2. 按"轮次"切分，不切割 tool_call + tool_result 对
- *      一轮 = 从 user 消息到 LLM 给出 content 的所有消息。
- *      压缩边界不让工具调用链拦腰截断——LLM 看不到上半条链没法理解上下文。
- *
- *   3. 压缩后二次 Token 检查
- *      LLM 可能输出比原文还长的"啰嗦摘要"——压缩后重新算 Token，
- *      如果仍然 > 80%，强制降级为截断。
- *
- *   4. 冷却期
- *      避免频繁压缩——压缩本身消耗 ~1000 Token，每几轮压一次不划算。
- *      距离上次压缩 5 轮内不触发二次压缩。
- *
- *   5. 两条降级路径
- *      路径 A：LLM 调用失败 → 简单截断，保留最近 5 轮
- *      路径 B：压缩后仍然超限 → 强制截断到 3 轮
- *
- *   6. system 消息保护
- *      压缩时不包含 system prompt，压缩结果以 system 角色注入。
+ * <p>压缩以完整 user 轮次为边界，不拆开 Tool Call 与 Tool Result；基础 system 消息
+ * 不参与摘要。压缩后会重新检查预算，模型调用失败或摘要仍过长时降级为保留最近轮次。
+ * 冷却期用于避免频繁压缩本身消耗过多 Token。</p>
  */
 public class ConversationCompactor {
 
@@ -135,7 +114,7 @@ public class ConversationCompactor {
                 .addKeyValue("compression_ratio", ratio)
                 .log("对话压缩完成");
 
-        // 原地替换 history —— 关键修复：旧实现返回新对象被调用方丢弃，压缩形同虚设
+        // 调用方持有原列表引用，因此必须原地替换。
         return replaceInPlace(history, compacted);
     }
 
@@ -145,9 +124,7 @@ public class ConversationCompactor {
      * 按 user 消息切分轮次。
      * 一轮 = 从一条 user 消息到下一个 user 消息之前的所有消息。
      *
-     * 为什么不用 assistant 的 content 来切？
-     *   因为 Plan-and-Execute 的 /plan 注入用 system 角色，不能用 role=="assistant" 切。
-     *   唯一稳定的边界是 user 消息。
+     * user 消息是稳定的轮次起点；使用 assistant 或 system 作为边界可能拆开工具调用链。
      */
     List<List<Message>> splitIntoTurns(List<Message> body) {
         List<List<Message>> turns = new ArrayList<>();

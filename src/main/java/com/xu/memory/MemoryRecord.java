@@ -4,16 +4,8 @@ import java.time.Instant;
 import java.util.UUID;
 
 /**
- * 一条长期知识 = 一个原子事实。取代旧的 LongTermMemory.MemoryEntry。
- *
- * 相比旧结构,把治理需要的信息提成一等字段(旧版塞在 metadata Map 里,弱类型易漂移):
- *   scope      — 项目专属 / 全局通用(跨项目隔离)
- *   projectKey — PROJECT 时属于哪个仓库;GLOBAL 时为 ""
- *   source     — 谁写的(HUMAN /save 高信任 / AGENT 自动沉淀需审查)
- *   confidence — 置信度 0..1,治理门据此决定直接入库还是挂起
- *   createdAt  — 写入时间,检索时间衰减用
- *
- * record 不可变:字段即访问器(content()/scope()...),天然适合当持久化 + 检索的数据载体。
+ * 不可变的原子长期记忆。作用域、来源、置信度和创建时间均为强类型字段，
+ * 供跨项目隔离、写入治理和检索时间衰减使用。
  */
 public record MemoryRecord(
         String id,
@@ -24,7 +16,7 @@ public record MemoryRecord(
         double confidence,
         Instant createdAt
 ) {
-    /** 新建候选的统一入口:自动生成 id/时间,GLOBAL 强制清空 projectKey。 */
+    /** 创建记忆候选；自动生成 ID 和时间，全局记忆不绑定项目。 */
     public static MemoryRecord create(String content, MemoryScope scope, String projectKey,
                                       MemorySource source, double confidence) {
         String id = "mem_" + UUID.randomUUID().toString().substring(0, 8);
@@ -33,9 +25,7 @@ public record MemoryRecord(
     }
 
     /**
-     * 当前仓库能否看到这条。
-     *   GLOBAL  → 到哪都可见
-     *   PROJECT → 要求当前仓库 key 与写入时的 projectKey 一致
+     * 判断当前项目能否读取此记忆：全局记忆始终可见，项目记忆必须匹配项目标识。
      */
     public boolean visibleIn(String currentProjectKey) {
         if (scope == MemoryScope.GLOBAL) return true;

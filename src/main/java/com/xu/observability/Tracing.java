@@ -5,6 +5,7 @@ import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
 import io.opentelemetry.sdk.autoconfigure.AutoConfiguredOpenTelemetrySdk;
 
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -22,15 +23,27 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class Tracing implements AutoCloseable {
 
-    private static final Tracing NOOP = new Tracing(null, null);
+    private static final Tracing NOOP = new Tracing(
+            null,
+            null,
+            AgentMetrics.noop(),
+            ExecutionArtifactStore.disabled());
 
     private final OpenTelemetrySdk sdk;
     private final Tracer tracer;
+    private final AgentMetrics metrics;
+    private final ExecutionArtifactStore artifacts;
     private final AtomicBoolean closed = new AtomicBoolean();
 
-    private Tracing(OpenTelemetrySdk sdk, Tracer tracer) {
+    private Tracing(
+            OpenTelemetrySdk sdk,
+            Tracer tracer,
+            AgentMetrics metrics,
+            ExecutionArtifactStore artifacts) {
         this.sdk = sdk;
         this.tracer = tracer;
+        this.metrics = metrics;
+        this.artifacts = artifacts;
     }
 
     /**
@@ -43,6 +56,16 @@ public final class Tracing implements AutoCloseable {
      * @return 应用进程内共享的追踪入口
      */
     public static Tracing create() {
+        String configured = System.getProperty("xcode.observability.dir");
+        Path root = configured == null || configured.isBlank()
+                ? Path.of(System.getProperty("user.home"),
+                        ".xcode", "observability")
+                : Path.of(configured);
+        return create(root);
+    }
+
+    /** 初始化遥测，并将诊断产物保存到 {@code root} 下。 */
+    public static Tracing create(Path root) {
         Map<String, String> defaults = new HashMap<>();
         if (System.getenv("OTEL_TRACES_EXPORTER") == null
                 && System.getProperty("otel.traces.exporter") == null) {
@@ -65,7 +88,11 @@ public final class Tracing implements AutoCloseable {
                 .addPropertiesSupplier(() -> defaults)
                 .build()
                 .getOpenTelemetrySdk();
-        return new Tracing(sdk, sdk.getTracer("com.xu.xcode-agent"));
+        return new Tracing(
+                sdk,
+                sdk.getTracer("com.xu.xcode-agent"),
+                new AgentMetrics(sdk.getMeter("com.xu.xcode-agent")),
+                ExecutionArtifactStore.create(root));
     }
 
     /**
@@ -78,11 +105,23 @@ public final class Tracing implements AutoCloseable {
 
     /** 包可见工厂，仅供本包测试用自定义 SDK 验证 Span。 */
     static Tracing from(OpenTelemetrySdk sdk) {
-        return new Tracing(sdk, sdk.getTracer("com.xu.xcode-agent-test"));
+        return new Tracing(
+                sdk,
+                sdk.getTracer("com.xu.xcode-agent-test"),
+                new AgentMetrics(sdk.getMeter("com.xu.xcode-agent-test")),
+                ExecutionArtifactStore.disabled());
+    }
+
+    public AgentMetrics metrics() {
+        return metrics;
+    }
+
+    public ExecutionArtifactStore artifacts() {
+        return artifacts;
     }
 
     /**
-     * 创建应用内部操作 Span，例如 {@code agent.run}、{@code agent.turn}
+     * 创建应用内部操作 Span，例如 {@code coding.task}、{@code agent.turn}
      * 和 {@code tool.execute}。
      *
      * @param spanName 稳定、低基数的操作名称
@@ -119,6 +158,8 @@ public final class Tracing implements AutoCloseable {
             return;
         }
         sdk.getSdkTracerProvider().forceFlush().join(5, TimeUnit.SECONDS);
+        sdk.getSdkMeterProvider().forceFlush().join(5, TimeUnit.SECONDS);
         sdk.getSdkTracerProvider().shutdown().join(5, TimeUnit.SECONDS);
+        sdk.getSdkMeterProvider().shutdown().join(5, TimeUnit.SECONDS);
     }
 }

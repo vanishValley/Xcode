@@ -9,7 +9,7 @@
 ![Java](https://img.shields.io/badge/Java-17-ED8B00?style=flat-square&logo=openjdk&logoColor=white)
 ![Maven](https://img.shields.io/badge/Maven-3.8+-C71A36?style=flat-square&logo=apachemaven&logoColor=white)
 ![LLM](https://img.shields.io/badge/LLM-DeepSeek-4D6BFE?style=flat-square)
-![Tests](https://img.shields.io/badge/JUnit-158_tests-25A162?style=flat-square&logo=junit5&logoColor=white)
+![Tests](https://img.shields.io/badge/JUnit-165_tests-25A162?style=flat-square&logo=junit5&logoColor=white)
 
 </div>
 
@@ -72,7 +72,10 @@ flowchart TB
     HITL --> MCP["MCP Tools"]
 
     SKILL["SkillRegistry"] --> REACT
-    MCPCLIENT["stdio JSON-RPC Client"] --> MCP
+    MCPCLIENT["MCP Client"] --> STDIO["stdio Transport"]
+    MCPCLIENT --> HTTP["Streamable HTTP Transport"]
+    STDIO --> MCP
+    HTTP --> MCP
 
     CANCEL["CancellationToken"] -. "贯穿运行链路" .-> REACT
     CANCEL -.-> PAE
@@ -92,7 +95,8 @@ com.xu
 ├── tool/           工具协议、注册表、执行器与内置工具
 ├── memory/         会话、上下文压缩、长期记忆与经验提炼
 ├── skill/          Skill 发现、解析、覆盖与状态管理
-├── mcp/            stdio JSON-RPC 与 Chrome DevTools MCP
+├── http/           OkHttp 可中断执行支持
+├── mcp/            通用 MCP 协议、懒加载与 stdio / HTTP Transport
 ├── hitl/           风险策略、人工审批与工具拦截
 ├── llm/            DeepSeek API、SSE 与 Tool Call 重组
 ├── observability/  Trace、MDC 和跨线程上下文传播
@@ -122,9 +126,12 @@ com.xu
 
 这里有三个关键设计。
 
-#### 任务级快照
+#### 任务级记忆快照与动态工具
 
-`MemoryManager.beginTask()` 和 `ToolRegistry.toOpenAiTools()` 只在任务开始时调用一次。后续多轮 Tool Call 复用同一份长期记忆和工具定义，避免任务执行途中因为热重载产生前后不一致的上下文。
+`MemoryManager.beginTask()` 在任务开始时冻结本次长期记忆，避免执行途中因热重载
+产生前后不一致的知识上下文；工具定义则在每个 ReAct 轮次重新从
+`ToolRegistry` 生成，使 `start_*_mcp` 完成后动态注册的 MCP 工具能在下一轮
+立即被模型看到。
 
 #### 流式文本与 Tool Call 分开处理
 
@@ -312,20 +319,26 @@ builtin < ~/.xcode/skills < <project>/.xcode/skills
 
 ### 6. MCP 外部能力
 
-项目通过 stdio JSON-RPC 2.0 接入 Chrome DevTools MCP：
+项目使用一个通用 `McpClient` 承担握手、工具发现和调用，并通过不同
+Transport 接入本地与远程 MCP：
 
 ```text
-启动 MCP 子进程
+start_*_mcp（首次使用）
+  → LazyMcpClient 保证并发只初始化一次
   → initialize / initialized
   → tools/list 分页发现能力
-  → 添加 mcp__chrome-devtools__ 命名空间
+  → 白名单过滤并添加 mcp__<server>__ 命名空间
   → 动态注册到 ToolRegistry
   → tools/call
 ```
 
-`StdioJsonRpcClient` 只负责进程生命周期、请求 ID、响应匹配、超时和协议错误；`ChromeMcpClient` 负责 MCP 握手、工具发现和语义转换。外部工具的行为无法由本项目完全预测，因此所有 `mcp__*` 工具默认经过 HITL。
+`StdioMcpTransport` 负责 Chrome 子进程、请求 ID 和响应匹配；
+`StreamableHttpMcpTransport` 负责 DeepWiki 的 HTTP POST、JSON/SSE 双响应、
+Session Header 和远程会话关闭。两种传输共享同一套 MCP 生命周期与动态 Tool
+适配代码。外部工具的行为无法由本项目完全预测，因此所有 `mcp__*` 工具默认经过 HITL。
 
-MCP 启动失败不会影响本地工具和主 Agent，系统会降级继续运行。
+MCP 在应用启动时不连接：Chrome 不会提前启动 npx，DeepWiki 也不会提前发起
+网络请求。首次连接失败只影响本次启动工具调用，不影响本地工具和主 Agent。
 
 ---
 
@@ -436,6 +449,7 @@ Agent / Plan / Tool / HITL
 - Maven 3.8+
 - DeepSeek API Key
 - 可选：Node.js、npm/npx、Chrome，用于 Chrome DevTools MCP
+- 可选：访问 DeepWiki 的网络，用于公开 GitHub 仓库分析
 - 可选：腾讯云联网搜索 API Key，用于 `web_search`
 
 ### 1. 克隆与配置
@@ -473,6 +487,10 @@ WSA_API_KEY=your_tencent_wsa_api_key_here
 CHROME_MCP_ENABLED=true
 CHROME_MCP_HEADLESS=true
 CHROME_MCP_PACKAGE=chrome-devtools-mcp@1.6.0
+
+# 可选：DeepWiki 远程 MCP（无需 API Key）
+DEEPWIKI_MCP_ENABLED=true
+DEEPWIKI_MCP_URL=https://mcp.deepwiki.com/mcp
 
 # 可选：日志
 XCODE_LOG_LEVEL=INFO
@@ -554,7 +572,7 @@ java -jar target/Xcode-1.0-SNAPSHOT.jar --ui=tui
 
 ## 测试
 
-项目目前包含 **42 个测试类、158 项 JUnit 测试**。
+项目目前包含 **46 个测试类、165 项 JUnit 测试**。
 
 覆盖范围包括：
 
@@ -566,7 +584,7 @@ java -jar target/Xcode-1.0-SNAPSHOT.jar --ui=tui
 - 长期记忆检索、去重、治理、持久化和 Prompt 注入；
 - Session 持久化、Token 预算和对话压缩；
 - Skill frontmatter、三层覆盖、禁用和热重载；
-- MCP JSON-RPC 请求匹配、分页、超时和关闭；
+- MCP stdio 请求匹配、Streamable HTTP JSON/SSE、Session Header、懒加载并发、分页、超时和关闭；
 - OpenTelemetry Span、MDC 与线程池上下文传播；
 - HITL 审批、会话放行和取消释放；
 - API Key、Token、ANSI、OSC 与 Unicode 控制符脱敏；

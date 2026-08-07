@@ -15,9 +15,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.MDC;
 
-/**
- * Bridges synchronous tool approval to the asynchronous terminal event loop.
- */
+/** 将同步工具审批桥接到异步终端事件循环。 */
 public final class TuiHitlHandler implements HitlHandler {
 
     private final UiEventSink events;
@@ -90,14 +88,14 @@ public final class TuiHitlHandler implements HitlHandler {
         }
     }
 
-    /** Opens a fresh foreground run after a previous cancellation. */
+    /** 上一次取消流程结束后，开始接受新的前台任务。 */
     public void beginRun() {
         synchronized (stateLock) {
             accepting = true;
         }
     }
 
-    /** Completes all waiters during Ctrl+C, EOF or terminal shutdown. */
+    /** 收到 Ctrl+C、EOF 或终端关闭时，解除所有审批等待。 */
     public void cancelPending(String reason) {
         ApprovalResult rejection = rejected(reason);
         synchronized (stateLock) {
@@ -109,8 +107,8 @@ public final class TuiHitlHandler implements HitlHandler {
     }
 
     /**
-     * Resolves one visible request. Approve-all also releases already queued
-     * requests for the same tool, so parallel Plan workers do not ask twice.
+     * 完成当前审批；选择“本会话始终允许”时，也放行队列中同工具的请求，
+     * 避免并行 Plan Worker 重复询问。
      */
     public boolean completeApproval(
             UiEvent.ApprovalRequested request,

@@ -10,10 +10,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.MDC;
 
 /**
- * Human approval for plain CLI mode.
+ * plain CLI 的人工审批实现。
  *
- * <p>The application should inject its shared Scanner so exactly one object
- * owns stdin. The no-argument constructor is retained for API compatibility.</p>
+ * <p>应用应注入共享的 Scanner，确保标准输入只有一个读取者；无参构造器仅为兼容旧 API 保留。</p>
  */
 public class TerminalHitlHandler implements HitlHandler {
 

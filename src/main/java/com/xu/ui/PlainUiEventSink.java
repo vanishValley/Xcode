@@ -3,7 +3,7 @@ package com.xu.ui;
 import java.io.PrintWriter;
 import java.util.stream.Collectors;
 
-/** Minimal, ANSI-free renderer for redirected input and unsupported terminals. */
+/** 用于重定向输入和不受支持终端的轻量无 ANSI 渲染器。 */
 public final class PlainUiEventSink implements UiEventSink {
 
     private final PrintWriter writer;

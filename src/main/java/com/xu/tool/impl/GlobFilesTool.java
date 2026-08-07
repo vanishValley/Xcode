@@ -8,17 +8,8 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * 文件名 glob 搜索工具 —— Agent 探索代码库的核心能力。
- *
- * 对标 PaiCLI / Claude Code 的 glob_files：
- *   - 支持 ** 递归匹配（如 "**\/*.java" 找所有 Java 文件）
- *   - 自动跳过常见构建/IDE/依赖目录（target、.git、node_modules 等）
- *   - 结果去重、排序、限制上限
- *
- * 为什么需要这个工具？
- *   list_dir 只能看一层，Agent 不知道深层有什么文件。
- *   glob_files 一句 "**\/*Test.java" 就能搜遍全项目，
- *   比让 LLM 反复一层层 list_dir 高效得多。
+ * 在项目中按 Glob 递归搜索文件。自动跳过构建、IDE 和依赖目录，
+ * 并对结果去重、排序和限量。
  */
 public class GlobFilesTool implements Tool {
 

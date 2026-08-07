@@ -7,6 +7,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.xu.observability.TraceScope;
 import com.xu.observability.Tracing;
+import com.xu.observability.ExecutionArtifactStore;
 import okhttp3.OkHttpClient;
 import okhttp3.MediaType;
 import okhttp3.Call;
@@ -30,6 +31,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
+/**
+ * DeepSeek Chat Completions 客户端，支持普通请求、SSE 流式文本、碎片化 Tool Call 重组
+ * 和主动取消。观测数据只记录模型、用量和内容长度，不记录 Prompt 正文。
+ */
 public class LlmClient {
 
     private static final Logger logger = LoggerFactory.getLogger(LlmClient.class);
@@ -76,14 +81,19 @@ public class LlmClient {
         // 每次真实的 HTTP 请求对应一个 Client Span；父 Span 由调用方自动继承。
         // 这里只记录规模和 Token，不记录消息、Prompt、工具定义等正文。
         try (TraceScope scope = tracing.startClient("llm.chat")
-                .attribute("gen_ai.model", model)
+                .attribute("gen_ai.operation.name", "chat")
+                .attribute("gen_ai.provider.name", "deepseek")
+                .attribute("gen_ai.request.model", model)
                 .attribute("llm.message_count", messages.size())
                 .attribute("llm.tool_definition_count",
                         tools == null ? 0L : tools.size())) {
+            ExecutionArtifactStore.Operation artifact = null;
             try {
                 ChatRequest request = new ChatRequest(model, messages, false, tools);
                 String json = objectMapper.writeValueAsString(request);
                 scope.attribute("llm.request_chars", json.length());
+                artifact = tracing.artifacts().beginOperation(
+                        "llm", model, json);
 
                 Request httpRequest = new Request.Builder()
                         .url(BASE_URL + "/chat/completions")
@@ -97,6 +107,7 @@ public class LlmClient {
                     scope.attribute("http.status_code", response.code());
                     String body = response.body().string();
                     if (!response.isSuccessful()) {
+                        artifact.failure(body);
                         throw new IOException(
                                 "LLM API error " + response.code()
                                         + ", response_chars=" + body.length());
@@ -119,13 +130,18 @@ public class LlmClient {
                                 chatResponse.usage.completionTokens;
                         choice.message.totalTokens =
                                 chatResponse.usage.totalTokens;
-                        scope.attribute("gen_ai.input_tokens",
+                        scope.attribute("gen_ai.usage.input_tokens",
                                 chatResponse.usage.promptTokens);
-                        scope.attribute("gen_ai.output_tokens",
+                        scope.attribute("gen_ai.usage.output_tokens",
                                 chatResponse.usage.completionTokens);
-                        scope.attribute("gen_ai.total_tokens",
-                                chatResponse.usage.totalTokens);
                     }
+                    artifact.success(body);
+                    tracing.metrics().recordLlm(
+                            model,
+                            "SUCCESS",
+                            scope.elapsedMillis(),
+                            choice.message.inputTokens,
+                            choice.message.outputTokens);
                     logger.atDebug()
                             .addKeyValue("event", "llm.chat.completed")
                             .addKeyValue("model", model)
@@ -144,6 +160,9 @@ public class LlmClient {
                 }
             } catch (IOException | RuntimeException error) {
                 scope.fail(error);
+                if (artifact != null) artifact.failure(error.toString());
+                tracing.metrics().recordLlm(
+                        model, "FAILED", scope.elapsedMillis(), 0L, 0L);
                 logger.atError()
                         .addKeyValue("event", "llm.chat.failed")
                         .addKeyValue("model", model)
@@ -152,14 +171,13 @@ public class LlmClient {
                         .setCause(error)
                         .log("LLM 调用失败");
                 throw error;
+            } finally {
+                if (artifact != null) artifact.close();
             }
         }
     }
 
-    /**
-     * Streams assistant text while still reconstructing the exact Message
-     * shape required by the ReAct loop, including fragmented tool calls.
-     */
+    /** 流式输出 assistant 文本，同时重组 ReAct 所需的完整消息和碎片化 Tool Call。 */
     public Message chatRawStreaming(
             List<Message> messages,
             List<Map<String, Object>> tools,
@@ -167,16 +185,21 @@ public class LlmClient {
         Consumer<String> deltaConsumer =
                 onTextDelta == null ? ignored -> { } : onTextDelta;
         try (TraceScope scope = tracing.startClient("llm.chat")
-                .attribute("gen_ai.model", model)
+                .attribute("gen_ai.operation.name", "chat")
+                .attribute("gen_ai.provider.name", "deepseek")
+                .attribute("gen_ai.request.model", model)
                 .attribute("llm.streaming", true)
                 .attribute("llm.message_count", messages.size())
                 .attribute("llm.tool_definition_count",
                         tools == null ? 0L : tools.size())) {
+            ExecutionArtifactStore.Operation artifact = null;
             try {
                 ChatRequest request =
                         new ChatRequest(model, messages, true, tools);
                 String json = objectMapper.writeValueAsString(request);
                 scope.attribute("llm.request_chars", json.length());
+                artifact = tracing.artifacts().beginOperation(
+                        "llm-stream", model, json);
 
                 Request httpRequest = new Request.Builder()
                         .url(BASE_URL + "/chat/completions")
@@ -191,6 +214,7 @@ public class LlmClient {
                     scope.attribute("http.status_code", response.code());
                     if (!response.isSuccessful()) {
                         String body = response.body().string();
+                        artifact.failure(body);
                         throw new IOException(
                                 "LLM API error " + response.code()
                                         + ", response_chars=" + body.length());
@@ -237,14 +261,18 @@ public class LlmClient {
                                     "gen_ai.finish_reason",
                                     result.finishReason)
                             .attribute(
-                                    "gen_ai.input_tokens",
+                                    "gen_ai.usage.input_tokens",
                                     result.inputTokens)
                             .attribute(
-                                    "gen_ai.output_tokens",
-                                    result.outputTokens)
-                            .attribute(
-                                    "gen_ai.total_tokens",
-                                    result.totalTokens);
+                                    "gen_ai.usage.output_tokens",
+                                    result.outputTokens);
+                    artifact.success(objectMapper.writeValueAsString(result));
+                    tracing.metrics().recordLlm(
+                            model,
+                            "SUCCESS",
+                            scope.elapsedMillis(),
+                            result.inputTokens,
+                            result.outputTokens);
                     logger.atDebug()
                             .addKeyValue("event", "llm.chat.completed")
                             .addKeyValue("model", model)
@@ -264,6 +292,9 @@ public class LlmClient {
                 }
             } catch (IOException | RuntimeException error) {
                 scope.fail(error);
+                if (artifact != null) artifact.failure(error.toString());
+                tracing.metrics().recordLlm(
+                        model, "FAILED", scope.elapsedMillis(), 0L, 0L);
                 logger.atError()
                         .addKeyValue("event", "llm.chat.failed")
                         .addKeyValue("model", model)
@@ -274,26 +305,26 @@ public class LlmClient {
                         .setCause(error)
                         .log("LLM 流式调用失败");
                 throw error;
+            } finally {
+                if (artifact != null) artifact.close();
             }
         }
     }
 
     /**
-     * Cancels every request owned by this client, including an SSE body that
-     * is currently blocked in {@link BufferedReader#readLine()}.
+     * 取消此客户端持有的全部请求，包括阻塞在
+     * {@link BufferedReader#readLine()} 的 SSE 响应体。
      *
-     * <p>The application allows only one foreground run, so cancelling the
-     * shared client is exactly the desired scope for both a normal Agent and
-     * all parallel workers of a Plan run.</p>
+     * <p>应用同一时刻只允许一个前台任务，因此取消共享客户端会同时覆盖普通 Agent
+     * 和当前 Plan 的所有并行 Worker。</p>
      */
     public void cancelActiveRequests() {
         activeCalls.forEach(Call::cancel);
     }
 
     /**
-     * Uses OkHttp's cancellable asynchronous call while preserving this
-     * client's synchronous API. Interrupting an Agent now cancels the socket
-     * instead of waiting for the HTTP timeout.
+     * 在保留同步调用接口的同时使用 OkHttp 可取消异步请求；Agent 被中断时会立即取消
+     * 底层连接，而不是等待 HTTP 超时。
      */
     private static Response executeInterruptibly(Call call)
             throws IOException {
@@ -320,17 +351,14 @@ public class LlmClient {
                     new InterruptedIOException("LLM request cancelled");
             cancelled.initCause(interrupted);
             if (!response.completeExceptionally(cancelled)) {
-                /*
-                 * The response may have won the race just before get()
-                 * observed the interrupt. No caller can receive it now.
-                 */
+                /* 响应可能在 get() 感知中断前刚好完成，但调用方已无法接收，必须主动关闭。 */
                 try {
                     Response orphan = response.getNow(null);
                     if (orphan != null) {
                         orphan.close();
                     }
                 } catch (RuntimeException ignored) {
-                    // The future already holds an exception; no body to close.
+                    // Future 中只有异常，没有需要关闭的响应体。
                 }
             }
             throw cancelled;
@@ -350,7 +378,7 @@ public class LlmClient {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static class Message {
-        public String role;       // system / user / assistant / tool
+        public String role;       // 消息角色：system / user / assistant / tool
         public String content;
         @JsonProperty("tool_calls")
         public List<ToolCall> toolCalls;     // assistant 调用工具时用

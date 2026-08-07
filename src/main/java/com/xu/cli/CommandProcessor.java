@@ -17,9 +17,7 @@ import org.slf4j.LoggerFactory;
 import java.nio.file.Path;
 import java.util.Optional;
 
-/**
- * UI-neutral command dispatcher shared by the JLine TUI and plain fallback.
- */
+/** 与界面无关的命令分发器，由 JLine TUI 和 plain 模式共同使用。 */
 public final class CommandProcessor {
 
     private static final Logger logger =

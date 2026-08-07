@@ -10,7 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/** Context-aware completion for slash commands and Skill names. */
+/** 根据输入位置补全 Slash Command 和 Skill 名称。 */
 final class CommandCompleter implements Completer {
 
     private static final Map<String, String> ROOT_COMMANDS =
@@ -48,10 +48,8 @@ final class CommandCompleter implements Completer {
         }
 
         /*
-         * JLine replaces only ParsedLine.word(), not the whole input buffer.
-         * Candidates therefore contain one token at a time. Supplying
-         * "/skill on foo" while completing the third token would duplicate
-         * the prefix and produce "/skill on /skill on foo".
+         * JLine 只替换 ParsedLine.word()，不会替换整行，所以候选项必须只包含当前词；
+         * 否则补全第三个参数时会重复插入 "/skill on" 前缀。
          */
         if (line.wordIndex() == 0) {
             ROOT_COMMANDS.forEach((command, description) -> candidates.add(
@@ -109,7 +107,7 @@ final class CommandCompleter implements Completer {
                     "记忆",
                     Map.of("-g", "保存为全局记忆"));
             default -> {
-                // Free-form arguments such as /plan <task> are not completed.
+            // /plan <任务> 等自由文本参数不参与补全。
             }
         }
     }

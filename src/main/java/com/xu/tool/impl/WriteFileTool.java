@@ -9,16 +9,8 @@ import java.nio.file.Path;
 import java.util.Map;
 
 /**
- * 文件写入工具 —— Agent 靠它创建或修改文件。
- *
- * 安全设计（对标 Claude Code / PaiCLI）：
- *   1. 所有路径相对于 projectRoot 解析，resolve 后校验没有逃逸到根外
- *   2. 大小上限 5MB，防 LLM 幻觉写出超大文件
- *   3. 自动创建不存在的父目录
- *
- * 为什么用 projectRoot 而不是拒绝所有绝对路径？
- *   因为测试、多项目切换等场景会产生合法的绝对路径。
- *   真正的安全边界是「不能逃逸到 projectRoot 外面」，不是「不能用绝对路径」。
+ * 在项目根目录内创建或覆盖文件。路径解析后必须仍位于项目根下，单次写入不超过 5 MB；
+ * 合法的绝对路径可以使用，但不能借此越过工作区边界。
  */
 public class WriteFileTool implements Tool {
 

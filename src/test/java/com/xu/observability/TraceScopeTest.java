@@ -44,14 +44,14 @@ class TraceScopeTest {
         String rootSpanId;
         String childSpanId;
 
-        try (TraceScope root = tracing.start("agent.run")) {
+        try (TraceScope root = tracing.start("coding.task")) {
             rootTraceId = root.traceId();
             rootSpanId = root.spanId();
             assertFalse(rootTraceId.isBlank());
             assertEquals(rootTraceId, MDC.get("trace_id"));
             assertEquals(rootSpanId, MDC.get("span_id"));
 
-            try (TraceScope child = tracing.start("agent.turn")) {
+            try (TraceScope child = tracing.start("agent.invoke")) {
                 childSpanId = child.spanId();
                 assertEquals(rootTraceId, child.traceId());
                 assertNotEquals(rootSpanId, childSpanId);

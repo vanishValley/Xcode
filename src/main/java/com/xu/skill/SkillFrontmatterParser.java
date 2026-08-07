@@ -3,16 +3,10 @@ package com.xu.skill;
 import java.util.*;
 
 /**
- * 手写 YAML 子集解析器 —— 只解析 SKILL.md 的 frontmatter 头。
+ * SKILL.md Frontmatter 的轻量 YAML 子集解析器。
  *
- * 为什么不用 SnakeYAML / Jackson YAML?
- *   - 只需要 3 种语法: key: value / key: | 多行块 / key: [a, b] 行内数组
- *   - frontmatter 只有 5 个字段(name / description / version / author / tags)
- *   - 引入 SnakeYAML 要新增依赖, Jackson YAML 模块约 1.2MB
- *   - 手写 100 行, 零依赖, 解析失败不阻塞加载
- *
- * 不支持: 嵌套对象 {key: {sub: val}} / 数组逐行写法 / 锚点 & 引用 / 类型标签
- * 遇到不支持的语法 → 记录 warning → 跳过该字段 → 继续解析
+ * <p>仅支持标量、多行块和行内数组，不支持嵌套对象、逐行数组、锚点和类型标签。
+ * 不支持或无效的字段会产生警告并被跳过，不阻止其他 Skill 加载。</p>
  */
 public final class SkillFrontmatterParser {
 

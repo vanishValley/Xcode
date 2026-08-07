@@ -33,9 +33,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * Inline JLine application with one active Agent run and one terminal writer.
- */
+/** 基于 JLine 的行内终端应用，同一时刻只运行一个 Agent 任务并由单线程写终端。 */
 public final class TuiApplication implements AutoCloseable {
 
     private static final long TICK_MILLIS = 80L;
@@ -114,9 +112,8 @@ public final class TuiApplication implements AutoCloseable {
                 .option(LineReader.Option.DISABLE_EVENT_EXPANSION, true)
                 .build();
         /*
-         * LineReaderBuilder attaches a supplied History before applying all
-         * variables on some JLine versions. Reload after construction so the
-         * configured project-scoped file is actually read and sanitized.
+         * 部分 JLine 版本会在应用变量前绑定 History，因此构造完成后重新加载，
+         * 确保读取并净化项目级历史文件。
          */
         this.reader.getHistory().attach(this.reader);
         this.reader.getHistory().load();
@@ -136,9 +133,8 @@ public final class TuiApplication implements AutoCloseable {
         this.previousInterruptHandler = terminal.handle(
                 Terminal.Signal.INT, ignored -> requestCancellation());
         /*
-         * Keep echo disabled between readLine calls. Without this, type-ahead
-         * during an Agent run is echoed through the status display and may be
-         * consumed by a later approval prompt.
+         * 两次 readLine 之间保持关闭回显，防止任务运行期的预输入污染状态栏，
+         * 或被后续审批误当作用户选择。
          */
         this.originalTerminalAttributes = terminal.enterRawMode();
     }
@@ -287,9 +283,8 @@ public final class TuiApplication implements AutoCloseable {
                     } else if (System.nanoTime() - cancellationStartedAt
                             >= TimeUnit.SECONDS.toNanos(3)) {
                         /*
-                         * Do not reopen the prompt while an uncooperative
-                         * tool might still mutate state. End the application;
-                         * the executor thread is daemonized as a final guard.
+                         * 工具未按取消请求退出时可能仍会修改状态，因此不再打开提示符，
+                         * 直接结束应用；守护执行线程是最后一道隔离措施。
                          */
                         closed.set(true);
                         outcome.complete(CommandProcessor.Result.of(
@@ -314,10 +309,7 @@ public final class TuiApplication implements AutoCloseable {
                 try {
                     outcome.get(3, TimeUnit.SECONDS);
                 } catch (Exception didNotStop) {
-                    /*
-                     * Never reopen the prompt while an old run could still
-                     * reach a mutating tool. close() will shut down resources.
-                     */
+                    /* 旧任务仍可能触达可变工具时不再打开提示符，由 close() 统一释放资源。 */
                     closed.set(true);
                 }
             }
@@ -481,7 +473,7 @@ public final class TuiApplication implements AutoCloseable {
                 discarded = true;
             }
         } catch (IOException ignored) {
-            // Best effort; LineReader remains the only normal input owner.
+            // 尽力清空预输入；正常情况下仍只有 LineReader 读取终端。
         }
         return discarded;
     }

@@ -5,10 +5,9 @@ import java.util.Deque;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Thread-safe event queue used by the TUI.
+ * TUI 使用的线程安全事件队列。
  *
- * <p>Plan workers may publish concurrently, but only the TUI thread consumes
- * and renders events, preventing interleaved ANSI output.</p>
+ * <p>Plan Worker 可以并发发布事件，但只由 TUI 线程消费和渲染，避免 ANSI 输出交错。</p>
  */
 public final class QueueUiEventSink implements UiEventSink {
 
@@ -19,10 +18,7 @@ public final class QueueUiEventSink implements UiEventSink {
         if (event == null) {
             return;
         }
-        /*
-         * Streaming callbacks may produce hundreds of tiny chunks per second.
-         * Coalesce adjacent deltas without crossing a tool/status boundary.
-         */
+        /* 流式回调会产生大量小片段；只合并相邻文本增量，不跨越工具或状态事件。 */
         if (event instanceof UiEvent.AssistantDelta delta
                 && queue.peekLast() instanceof UiEvent.AssistantDelta previous
                 && previous.taskLabel().equals(delta.taskLabel())) {

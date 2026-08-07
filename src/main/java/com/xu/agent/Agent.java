@@ -217,11 +217,7 @@ public class Agent {
             long outputTokens) {
     }
 
-    /**
-     * Signals that a run failed after at least one tool may have changed
-     * external state. Callers must not treat this as an ordinary retryable
-     * failure.
-     */
+    /** 表示任务失败前至少有一个工具可能已修改外部状态；调用方不得按普通失败自动重试。 */
     public static final class PartialExecutionException extends Exception {
         private final boolean cancelled;
 
@@ -269,12 +265,76 @@ public class Agent {
     /**
      * 执行一次完整的用户任务。
      *
-     * <p>{@code agent.run} 覆盖整次任务，每轮“调用 LLM -> 判断回复 ->
+     * <p>{@code coding.task} 是用户任务根节点，{@code agent.invoke} 覆盖
+     * Agent 执行；每轮“调用 LLM -> 判断回复 ->
      * 执行工具”创建一个 {@code agent.turn} 子 Span。LLM、工具和 MCP
      * 会在各自组件中继续创建更细的子 Span。</p>
      */
     public String run(String userInput) throws Exception {
-        return runDetailed(userInput).content();
+        try (MdcScope ignored = MdcScope.put("task_id", "main");
+             TraceScope taskScope = tracing.start("coding.task")
+                     .attribute("task.mode", "REACT")
+                     .attribute("task.input_chars", userInput.length())) {
+            tracing.artifacts().beginTrace(
+                    taskScope.traceId(), "REACT", userInput);
+            try {
+                RunResult result = runDetailed(userInput);
+                taskScope.attribute("task.outcome", result.outcome())
+                        .attribute("agent.turn.count", result.turns())
+                        .attribute("agent.llm.call_count", result.llmCalls())
+                        .attribute("agent.tool.call_count", result.toolCalls())
+                        .attribute("agent.recovered_error_count",
+                                result.recoveredErrors())
+                        .attribute("agent.usage.input_tokens", result.inputTokens())
+                        .attribute("agent.usage.output_tokens", result.outputTokens());
+                tracing.metrics().recordTask(
+                        "REACT",
+                        result.outcome(),
+                        taskScope.elapsedMillis());
+                tracing.artifacts().completeTrace(
+                        taskScope.traceId(),
+                        result.outcome(),
+                        result.recoveredErrors() > 0);
+                logger.atInfo()
+                        .addKeyValue("event", "coding.task.completed")
+                        .addKeyValue("mode", "REACT")
+                        .addKeyValue("outcome", result.outcome())
+                        .addKeyValue("turn_count", result.turns())
+                        .addKeyValue("llm_calls", result.llmCalls())
+                        .addKeyValue("tool_calls", result.toolCalls())
+                        .addKeyValue("recovered_errors",
+                                result.recoveredErrors())
+                        .addKeyValue("input_tokens", result.inputTokens())
+                        .addKeyValue("output_tokens", result.outputTokens())
+                        .addKeyValue("duration_ms", taskScope.elapsedMillis())
+                        .log("Coding Agent task completed");
+                return result.content();
+            } catch (Exception error) {
+                boolean cancelled = error instanceof InterruptedException
+                        || error instanceof java.io.InterruptedIOException
+                        || Thread.currentThread().isInterrupted();
+                String outcome = cancelled ? "CANCELLED" : "FAILED";
+                if (!cancelled) taskScope.fail(error);
+                taskScope.attribute("task.outcome", outcome);
+                tracing.metrics().recordTask(
+                        "REACT", outcome, taskScope.elapsedMillis());
+                tracing.artifacts().completeTrace(
+                        taskScope.traceId(), outcome, false);
+                var event = cancelled ? logger.atWarn() : logger.atError();
+                event.addKeyValue(
+                                "event",
+                                cancelled
+                                        ? "coding.task.cancelled"
+                                        : "coding.task.failed")
+                        .addKeyValue("mode", "REACT")
+                        .addKeyValue("outcome", outcome)
+                        .addKeyValue("error_type",
+                                error.getClass().getSimpleName())
+                        .addKeyValue("duration_ms", taskScope.elapsedMillis())
+                        .log("Coding Agent task did not complete");
+                throw error;
+            }
+        }
     }
 
     /**
@@ -304,12 +364,12 @@ public class Agent {
         // try-with-resources 保证正常返回或异常退出时都会结束根 Span。
         // attribute() 返回当前 TraceScope，因此可以连续链式调用。
         try (MdcScope ignored = MdcScope.put("task_id", taskLabel);
-             TraceScope runScope = tracing.start("agent.run")
+             TraceScope runScope = tracing.start("agent.invoke")
                 .attribute("agent.task_label", taskLabel)
                 .attribute("agent.input_chars", userInput.length())) {
             // Span 属性用于查看调用链；这条结构化日志用于按 trace_id 检索。
-            logger.atInfo()
-                    .addKeyValue("event", "agent.run.started")
+            logger.atDebug()
+                    .addKeyValue("event", "agent.invoke.started")
                     .addKeyValue("task_label", taskLabel)
                     .addKeyValue("input_chars", userInput.length())
                     .log("开始执行 Agent 任务");
@@ -330,39 +390,63 @@ public class Agent {
                 for (int turn = 0; turn < MAX_TURNS; turn++) {
                     cancellation.throwIfCancellationRequested();
                     turns = turn + 1;
-                    // start() 会自动继承当前 agent.run，形成父子 Span。
+                    // 子 Span 自动继承当前 agent.invoke，形成调用树。
                     try (TraceScope turnScope = tracing.start("agent.turn")
                             .attribute("agent.turn.index", turn + 1L)) {
-                        // 2a. 压缩干净历史
-                        if (memory != null) {
-                            double before =
-                                    memory.contextUsagePercent(history);
-                            memory.compactIfNeeded(history);
-                            double after =
-                                    memory.contextUsagePercent(history);
-                            if (before > 0.8) {
-                                logger.info("Token 压缩: {}% → {}%",
-                                        (int) (before * 100),
-                                        (int) (after * 100));
+                        List<Message> prompt;
+                        int usage;
+                        try (TraceScope contextScope =
+                                     tracing.start("context.prepare")) {
+                            if (memory != null) {
+                                double before =
+                                        memory.contextUsagePercent(history);
+                                if (before > 0.8) {
+                                    try (TraceScope compactScope =
+                                                 tracing.start("memory.compact")
+                                                         .attribute(
+                                                                 "memory.usage_before_percent",
+                                                                 (long) (before * 100))) {
+                                        memory.compactIfNeeded(history);
+                                        double after =
+                                                memory.contextUsagePercent(history);
+                                        compactScope.attribute(
+                                                "memory.usage_after_percent",
+                                                (long) (after * 100));
+                                        logger.atInfo()
+                                                .addKeyValue(
+                                                        "event",
+                                                        "memory.compact.completed")
+                                                .addKeyValue(
+                                                        "usage_before_percent",
+                                                        (int) (before * 100))
+                                                .addKeyValue(
+                                                        "usage_after_percent",
+                                                        (int) (after * 100))
+                                                .log("Conversation context compacted");
+                                    }
+                                } else {
+                                    memory.compactIfNeeded(history);
+                                }
                             }
+
+                            prompt = memory != null
+                                    ? memory.assemblePrompt(history)
+                                    : new ArrayList<>(history);
+                            usage = memory != null
+                                    ? (int) (memory.contextUsagePercent(prompt)
+                                            * 100)
+                                    : 0;
+                            contextScope.attribute(
+                                            "context.message_count",
+                                            prompt.size())
+                                    .attribute(
+                                            "context.estimated_usage_percent",
+                                            usage);
                         }
-
-                        // 2b. 从干净历史 + 注入块(目标/知识/上下文)组装本轮 prompt
-                        List<Message> prompt = memory != null
-                                ? memory.assemblePrompt(history)
-                                : new ArrayList<>(history);
-
-                        int usage = memory != null
-                                ? (int) (memory.contextUsagePercent(prompt) * 100)
-                                : 0;
-                        turnScope.attribute(
-                                        "context.message_count", prompt.size())
-                                .attribute(
-                                        "context.estimated_usage_percent", usage)
-                                .attribute("agent.tool_definition_count",
-                                        toolRegistry.isEmpty()
-                                                ? 0L
-                                                : toolRegistry.names().size());
+                        turnScope.attribute("agent.tool_definition_count",
+                                toolRegistry.isEmpty()
+                                        ? 0L
+                                        : toolRegistry.names().size());
                         logger.atDebug()
                                 .addKeyValue("event", "agent.turn.started")
                                 .addKeyValue("turn", turn + 1)
@@ -470,8 +554,8 @@ public class Agent {
 
                 if (finalReply != null) {
                     if (memory != null) {
-                        memory.persist(history);
-                        memory.tryAutoExtract(history, llmClient);
+                        persistSession();
+                        extractLongTermMemory();
                     }
                     runScope.attribute("agent.outcome", "SUCCESS")
                             .attribute("agent.turn.count", turns)
@@ -480,10 +564,10 @@ public class Agent {
                             .attribute(
                                     "agent.recovered_error_count",
                                     recoveredErrors)
-                            .attribute("gen_ai.input_tokens", inputTokens)
-                            .attribute("gen_ai.output_tokens", outputTokens);
-                    logger.atInfo()
-                            .addKeyValue("event", "agent.run.completed")
+                            .attribute("agent.usage.input_tokens", inputTokens)
+                            .attribute("agent.usage.output_tokens", outputTokens);
+                    logger.atDebug()
+                            .addKeyValue("event", "agent.invoke.completed")
                             .addKeyValue("task_label", taskLabel)
                             .addKeyValue("outcome", "SUCCESS")
                             .addKeyValue("turn_count", turns)
@@ -520,10 +604,10 @@ public class Agent {
                         .attribute("agent.tool.call_count", toolCalls)
                         .attribute(
                                 "agent.recovered_error_count", recoveredErrors)
-                        .attribute("gen_ai.input_tokens", inputTokens)
-                        .attribute("gen_ai.output_tokens", outputTokens);
+                        .attribute("agent.usage.input_tokens", inputTokens)
+                        .attribute("agent.usage.output_tokens", outputTokens);
                 logger.atWarn()
-                        .addKeyValue("event", "agent.run.max_turns")
+                        .addKeyValue("event", "agent.invoke.max_turns")
                         .addKeyValue("task_label", taskLabel)
                         .addKeyValue("outcome", "DEGRADED")
                         .addKeyValue("max_turns", MAX_TURNS)
@@ -536,8 +620,8 @@ public class Agent {
                                 "duration_ms", runScope.elapsedMillis())
                         .log("达到最大轮数仍未完成");
                 if (memory != null) {
-                    memory.persist(history);
-                    memory.tryAutoExtract(history, llmClient);
+                    persistSession();
+                    extractLongTermMemory();
                 }
                 RunResult degraded = new RunResult(
                         "已执行 " + MAX_TURNS
@@ -554,11 +638,8 @@ public class Agent {
                 return degraded;
             } catch (Exception error) {
                 /*
-                 * Once a tool has started, its external side effects cannot
-                 * be rolled back with the transcript. Preserve that coherent
-                 * evidence and fill any unanswered calls with an explicit
-                 * unknown-state result. Only a run that never reached a tool
-                 * is safe to restore wholesale.
+                 * 工具启动后，回滚对话无法撤销其外部副作用。此时保留已有执行证据，
+                 * 并为未完成调用补充“状态未知”；只有从未启动工具的任务才能整体回滚。
                  */
                 boolean partialToolEffects =
                         toolCalls > 0 || pendingToolReply != null;
@@ -570,17 +651,13 @@ public class Agent {
                                     + "部分外部副作用可能已经发生；"
                                     + "继续前请先检查工作区，不要盲目重复执行。"));
                     if (memory != null) {
-                        memory.persist(history);
+                        persistSession();
                     }
                 } else {
                     history.clear();
                     history.addAll(historyBeforeRun);
                     if (memory != null) {
-                        /*
-                         * Compaction mutates its own turn counter in addition
-                         * to rewriting history. A full rollback must reset the
-                         * companion state as well.
-                         */
+                    /* 压缩器除改写历史外还维护轮次计数，整体回滚时必须一并重置。 */
                         memory.resetCompactor();
                     }
                 }
@@ -591,10 +668,10 @@ public class Agent {
                                 partialToolEffects)
                         .attribute("agent.llm.call_count", llmCalls)
                         .attribute("agent.tool.call_count", toolCalls)
-                        .attribute("gen_ai.input_tokens", inputTokens)
-                        .attribute("gen_ai.output_tokens", outputTokens);
+                        .attribute("agent.usage.input_tokens", inputTokens)
+                        .attribute("agent.usage.output_tokens", outputTokens);
                 logger.atError()
-                        .addKeyValue("event", "agent.run.failed")
+                        .addKeyValue("event", "agent.invoke.failed")
                         .addKeyValue("task_label", taskLabel)
                         .addKeyValue("turn_count", turns)
                         .addKeyValue("llm_calls", llmCalls)
@@ -631,11 +708,10 @@ public class Agent {
     }
 
     /**
-     * Completes the final assistant tool-call block after interruption.
+     * 中断后补全最后一组 assistant Tool Call。
      *
-     * <p>Chat Completions requires one tool result for every call ID. Keeping
-     * successful results while synthesizing only the missing results preserves
-     * both protocol validity and the evidence of possible side effects.</p>
+     * <p>Chat Completions 要求每个调用 ID 都有对应的工具结果。保留已成功结果，
+     * 只为缺失项生成“状态未知”，既满足协议，也保留可能发生副作用的证据。</p>
      */
     private void completeInterruptedToolBatch(Message pendingToolReply) {
         if (pendingToolReply == null
@@ -670,6 +746,19 @@ public class Agent {
                 result.toolCallId = call.id;
                 history.add(result);
             }
+        }
+    }
+
+    private void persistSession() {
+        try (TraceScope scope = tracing.start("session.persist")
+                .attribute("session.message_count", history.size())) {
+            memory.persist(history);
+        }
+    }
+
+    private void extractLongTermMemory() {
+        try (TraceScope ignored = tracing.start("memory.extract")) {
+            memory.tryAutoExtract(history, llmClient);
         }
     }
 

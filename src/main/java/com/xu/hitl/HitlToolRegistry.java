@@ -4,6 +4,8 @@ import com.xu.tool.Tool;
 import com.xu.tool.ToolExecutionResult;
 import com.xu.tool.ToolRegistry;
 import com.xu.util.CancellationToken;
+import com.xu.observability.TraceScope;
+import com.xu.observability.Tracing;
 
 import java.util.Map;
 
@@ -20,18 +22,27 @@ public class HitlToolRegistry extends ToolRegistry {
 
     private final HitlHandler handler;
     private final CancellationToken cancellation;
+    private final Tracing tracing;
     private volatile boolean enabled = false;
 
     public HitlToolRegistry(HitlHandler handler) {
-        this(handler, new CancellationToken());
+        this(handler, new CancellationToken(), Tracing.noop());
     }
 
     public HitlToolRegistry(
             HitlHandler handler,
             CancellationToken cancellation) {
+        this(handler, cancellation, Tracing.noop());
+    }
+
+    public HitlToolRegistry(
+            HitlHandler handler,
+            CancellationToken cancellation,
+            Tracing tracing) {
         this.handler = handler;
         this.cancellation = cancellation == null
                 ? new CancellationToken() : cancellation;
+        this.tracing = tracing == null ? Tracing.noop() : tracing;
     }
 
     public void setEnabled(boolean e) { this.enabled = e; }
@@ -67,8 +78,15 @@ public class HitlToolRegistry extends ToolRegistry {
             public ToolExecutionResult executeObserved(
                     Map<String, Object> arguments) throws Exception {
                 cancellation.throwIfCancellationRequested();
-                ApprovalResult result = handler.requestApproval(
-                        original.name(), arguments);
+                ApprovalResult result;
+                try (TraceScope scope = tracing.start("hitl.wait")
+                        .attribute("tool.name", original.name())
+                        .attribute("hitl.danger_level",
+                                ApprovalPolicy.dangerLevel(original.name()))) {
+                    result = handler.requestApproval(
+                            original.name(), arguments);
+                    scope.attribute("hitl.decision", result.type().name());
+                }
                 cancellation.throwIfCancellationRequested();
 
                 if (result.isApproved()) {
@@ -80,7 +98,7 @@ public class HitlToolRegistry extends ToolRegistry {
                             "[HITL] 用户已跳过此步骤",
                             "HITL_SKIPPED");
                 }
-                // REJECTED
+                // 用户明确拒绝。
                 return ToolExecutionResult.failure(
                         "[HITL] 用户拒绝: " + result.reason(),
                         "HITL_REJECTED");

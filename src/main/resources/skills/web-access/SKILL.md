@@ -42,10 +42,16 @@ web_search(query)
 ### Chrome 浏览器降级
 
 ```text
+如果当前工具列表中还没有 mcp__chrome-devtools__*：
+start_chrome_mcp()
+→ 等待启动工具返回成功，进入下一轮
+
 mcp__chrome-devtools__navigate_page(url)
 → mcp__chrome-devtools__take_snapshot()
 → 从结构化页面文本中提取所需信息
 ```
+
+同一个任务中只调用一次 `start_chrome_mcp`；启动失败后不要循环重试。
 
 需要等待异步内容时使用 `wait_for`。读取内容优先 `take_snapshot`，只有视觉布局或用户明确要求图片时才使用 `take_screenshot`。
 

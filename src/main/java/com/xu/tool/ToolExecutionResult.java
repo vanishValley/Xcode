@@ -60,10 +60,8 @@ public record ToolExecutionResult(
     }
 
     /**
-     * Compatibility adapter for legacy String-returning tools.
-     *
-     * <p>New tools should override {@code executeObserved}; this adapter keeps
-     * old built-ins from painting obvious failures green in the TUI.</p>
+     * 将旧式字符串结果转换为结构化结果。新工具应实现 {@code executeObserved}；
+     * 此适配器负责识别旧工具的明显失败，避免界面将失败误报为成功。
      */
     public static ToolExecutionResult fromLegacyText(String content) {
         String value = content == null ? "" : content;

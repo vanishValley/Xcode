@@ -5,7 +5,7 @@ import org.jline.reader.LineReader;
 import org.jline.utils.AttributedString;
 import org.jline.utils.AttributedStringBuilder;
 
-/** Colors only trusted user input syntax; it never interprets ANSI. */
+/** 只高亮可信的用户输入语法，不解释 ANSI 控制序列。 */
 final class InputHighlighter implements Highlighter {
 
     @Override

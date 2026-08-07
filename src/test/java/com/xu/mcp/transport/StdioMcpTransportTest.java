@@ -1,4 +1,4 @@
-package com.xu.mcp;
+package com.xu.mcp.transport;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 
-class StdioJsonRpcClientTest {
+class StdioMcpTransportTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -35,25 +35,29 @@ class StdioJsonRpcClientTest {
 
                 output.write("""
                         {"jsonrpc":"2.0","id":%d,"result":{"value":"ok"}}
-                        """.formatted(request.path("id").asLong()).strip());
+                        """.formatted(
+                        request.path("id").asLong()).strip());
                 output.newLine();
                 output.flush();
             } catch (Exception ignored) {
-                // 断言由测试线程完成；关闭管道时服务端退出属于正常行为。
+                // 客户端关闭管道后，假服务端自然结束。
             }
-        }, "fake-json-rpc-server");
+        }, "fake-stdio-mcp-server");
         fakeServer.setDaemon(true);
         fakeServer.start();
 
-        try (StdioJsonRpcClient client =
-                     new StdioJsonRpcClient(clientOutput, clientInput)) {
-            JsonNode result = client.request(
-                    "demo/echo", JSON.createObjectNode().put("text", "hello"),
+        try (StdioMcpTransport transport =
+                     new StdioMcpTransport(clientOutput, clientInput)) {
+            JsonNode result = transport.request(
+                    "demo/echo",
+                    JSON.createObjectNode().put("text", "hello"),
                     Duration.ofSeconds(2));
 
             assertEquals("ok", result.path("value").asText());
-            assertEquals("2.0", received.get().path("jsonrpc").asText());
-            assertEquals("demo/echo", received.get().path("method").asText());
+            assertEquals("2.0",
+                    received.get().path("jsonrpc").asText());
+            assertEquals("demo/echo",
+                    received.get().path("method").asText());
             assertFalse(received.get().path("id").isMissingNode());
         }
     }

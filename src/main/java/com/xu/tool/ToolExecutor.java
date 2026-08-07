@@ -87,6 +87,7 @@ public final class ToolExecutor {
         String arguments = call != null && call.function != null
                 ? call.function.arguments : "";
         String callId = call == null ? null : call.id;
+        String category = toolName.startsWith("mcp__") ? "mcp" : "local";
         long startedAt = System.nanoTime();
         Map<String, Object> parsedArguments = Map.of();
         Map<String, Object> displayArguments = Map.of();
@@ -95,10 +96,11 @@ public final class ToolExecutor {
         try (TraceScope scope = tracing.start("tool.execute")
                 .attribute("tool.name", toolName)
                 .attribute("tool.call_id", callId)
-                .attribute("tool.category",
-                        toolName.startsWith("mcp__") ? "mcp" : "local")
+                .attribute("tool.category", category)
                 .attribute("tool.arguments_chars",
-                        arguments == null ? 0L : arguments.length())) {
+                        arguments == null ? 0L : arguments.length());
+             var artifact = tracing.artifacts().beginOperation(
+                     "tool", toolName, arguments)) {
 
             try {
                 parsedArguments = arguments == null || arguments.isBlank()
@@ -116,6 +118,10 @@ public final class ToolExecutor {
                 ToolExecutionResult failure = ToolExecutionResult.failure(
                         "工具参数解析出错：" + safeMessage(parseError),
                         errorType);
+                artifact.failure(failure.content());
+                tracing.metrics().recordTool(
+                        category, "FAILED", errorType,
+                        scope.elapsedMillis());
                 logException(
                         toolName,
                         callId,
@@ -142,6 +148,10 @@ public final class ToolExecutor {
                         null);
                 ToolExecutionResult failure = ToolExecutionResult.failure(
                         message, "TOOL_NOT_FOUND");
+                artifact.failure(failure.content());
+                tracing.metrics().recordTool(
+                        category, "FAILED", "TOOL_NOT_FOUND",
+                        scope.elapsedMillis());
                 emitCompleted(
                         callId,
                         toolName,
@@ -188,6 +198,10 @@ public final class ToolExecutor {
                 }
 
                 if (normalized.success()) {
+                    artifact.success(content);
+                    tracing.metrics().recordTool(
+                            category, "SUCCESS", null,
+                            scope.elapsedMillis());
                     var event = logger.atDebug()
                             .addKeyValue(
                                     "event", "tool.execute.completed")
@@ -210,6 +224,10 @@ public final class ToolExecutor {
 
                 String errorType = normalized.errorType();
                 scope.error(errorType, errorType);
+                artifact.failure(content);
+                tracing.metrics().recordTool(
+                        category, "FAILED", errorType,
+                        scope.elapsedMillis());
                 logReportedFailure(
                         toolName,
                         callId,
@@ -226,10 +244,7 @@ public final class ToolExecutor {
             } catch (Exception error) {
                 boolean cancelled = isCancellation(error);
                 if (cancelled) {
-                    /*
-                     * InterruptedException clears the flag when thrown.
-                     * Restore it so Agent stops before another tool call.
-                     */
+                    /* InterruptedException 抛出时会清除中断标记，这里恢复标记以阻止下一次工具调用。 */
                     Thread.currentThread().interrupt();
                 }
                 scope.fail(error);
@@ -248,6 +263,12 @@ public final class ToolExecutor {
                                 ? "工具执行已取消"
                                 : "工具执行出错：" + safeMessage(error),
                         errorType);
+                artifact.failure(failure.content());
+                tracing.metrics().recordTool(
+                        category,
+                        cancelled ? "CANCELLED" : "FAILED",
+                        errorType,
+                        scope.elapsedMillis());
                 emitCompleted(
                         callId,
                         toolName,

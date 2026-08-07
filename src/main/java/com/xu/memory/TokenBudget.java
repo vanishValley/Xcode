@@ -5,20 +5,10 @@ import com.xu.llm.LlmClient.Message;
 import java.util.List;
 
 /**
- * Token 预算管理 —— 估算上下文 Token 用量，判断是否需要压缩。
+ * 估算上下文 Token 用量并决定是否压缩。
  *
- * 为什么不用精确 Token 计数？
- *   精确计数需要 tiktoken 库（Python），Java 生态没有对等的实现。
- *   业界通用折中：字符数 ÷ 经验系数。
- *   中英文混合场景下系数 ≈ 2.5，误差 ±15%。
- *
- * 为什么压缩阈值是 80% 而不是 100%？
- *   100% 意味着请求发出去的时候上下文是满的——工具返回没地方放，
- *   LLM 推理输出没 buffer。80% 触发压缩，留 20% 给工具返回和 LLM 输出。
- *
- * 面试材料：
- *   "Token 预算不是精确计算，是工程估算。关键是保下限而不是争上限——
- *   系数总是偏保守（估计值偏大），触发压缩偏早不偏晚。"
+ * <p>当前按中英文混合文本约 2.5 字符/Token 做保守估算。占用达到 80% 时提前压缩，
+ * 为后续工具结果和模型输出保留空间；该估算用于容量保护，不追求计费级精度。</p>
  */
 public class TokenBudget {
 
@@ -34,10 +24,7 @@ public class TokenBudget {
     /** 中英混合文本的字符→Token 换算系数 */
     private static final double CHARS_PER_TOKEN = 2.5;
 
-    /**
-     * 构造函数
-     * @param maxContextWindow 模型的最大上下文窗口，如 DeepSeek 默认 128K
-     */
+    /** @param maxContextWindow 模型最大上下文窗口，例如 DeepSeek 默认 128K */
     public TokenBudget(long maxContextWindow) {
         this.maxContextWindow = maxContextWindow;
     }

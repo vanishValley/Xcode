@@ -28,23 +28,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Plan-and-Execute Agent —— "先规划，再执行"。
+ * 复杂任务的 Plan-and-Execute 编排器。
  *
- * 和 ReAct Agent 的区别：
- *   ReAct:  拿到任务 → 边想边做（走一步看一步）
- *   Plan:   拿到任务 → 先拆成步骤 → 按依赖顺序逐个执行
- *
- * 完整流程：
- *   1. 调用 Planner，让 LLM 把用户需求拆成 Task 列表
- *   2. 展示计划给用户
- *   3. 循环：找出所有"就绪"的 Task → 为每个 Task 启动子 Agent → 执行 → 记录结果
- *   4. 汇总所有结果，返回最终报告
- *
- * 为什么不直接在每一步里调工具？
- *   每个 Task 内部是一个独立的 ReAct 循环——LLM 看到 task 描述、
- *   上下文信息，自己决定调用哪些工具来完成这个子目标。
- *
- * 入口：Main 里用户输入 /plan <任务> 时触发
+ * <p>Planner 先生成 Task DAG；调度循环选择依赖已满足的任务，并最多并行运行四个
+ * 独立 ReAct Worker。每个结果经过 Reviewer 验收并写入检查点，确定性失败可重规划，
+ * 副作用未知的失败则停止自动执行。</p>
  */
 public class PlanExecuteAgent {
 
@@ -62,40 +50,40 @@ public class PlanExecuteAgent {
     private final CancellationToken cancellation;
     private final long taskTimeoutMillis;
 
-    /** Plan 进度持久化（断点续跑）；为 null 表示不启用持久化 */
+    /** Plan 进度检查点；为 {@code null} 表示不启用持久化。 */
     private final PlanStore planStore;
 
-    // 每个子 Task 执行时最多几轮工具调用
+    // 每个子任务允许的最大 ReAct 轮数。
     private static final int TASK_MAX_TURNS = 10;
 
     // 整个计划最多执行几轮（轮次 != 步骤数：同一轮可能并行执行多个步骤）
     private static final int PLAN_MAX_ROUNDS = 10;
 
-    // 最多重规划次数（防止 LLM 反复规划反复失败）
+    // 限制重规划次数，防止模型在失败计划间循环。
     private static final int MAX_REPLANS = 2;
 
-    // 并行执行：单 task 超时和每批线程数
+    // 单任务超时和最大并行度。
     private static final long DEFAULT_TASK_TIMEOUT_MILLIS =
             TimeUnit.MINUTES.toMillis(5);
     private static final int MAX_PARALLEL_TASKS = 4;
 
-    /** 不带持久化(子 Agent / 测试用) */
+    /** 不启用持久化，供子 Agent 和测试使用。 */
     public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry) {
         this(llmClient, toolRegistry, null, null, null, null);
     }
 
-    /** 带 checkpoint 持久化(主流程用,支持断点续跑) */
+    /** 启用检查点持久化，支持主流程断点恢复。 */
     public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry, PlanStore planStore) {
         this(llmClient, toolRegistry, planStore, null, null, null);
     }
 
-    /** 带 checkpoint + 知识共享(主流程用) */
+    /** 启用检查点和长期记忆共享。 */
     public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
                             PlanStore planStore, LongTermMemory longTermMemory, String projectPath) {
         this(llmClient, toolRegistry, planStore, longTermMemory, projectPath, null);
     }
 
-    /** 带 checkpoint + 知识共享 + Skill(主流程用) */
+    /** 启用检查点、长期记忆共享和 Skill。 */
     public PlanExecuteAgent(LlmClient llmClient, ToolRegistry toolRegistry,
                             PlanStore planStore, LongTermMemory longTermMemory,
                             String projectPath, SkillRegistry skillRegistry) {
@@ -170,23 +158,16 @@ public class PlanExecuteAgent {
     }
 
     /**
-     * 执行一次 Plan-and-Execute 流程。
-     *
-     * 完整流程：
-     *   1. 初始规划 → 2. DAG 循环执行 → 3. 某 Task 失败时触发重规划 → 4. 汇总报告
-     *
-     * 重规划（re-plan）机制：
-     *   当 Task 执行失败时，不直接放弃整个计划。
-     *   保留已完成的步骤，把失败原因 + 未完成的步骤描述发给 LLM，
-     *   让它基于当前进度生成新的替代步骤。最大重规划 2 次。
+     * 创建计划并执行；确定性失败时保留已完成步骤，最多重规划两次后汇总报告。
      */
     public String execute(String userRequest) throws Exception {
         PlanRunStats stats = new PlanRunStats();
 
-        // Plan 模式仍以 agent.run 作为整次用户任务的根 Span。
-        try (TraceScope runScope = tracing.start("agent.run")
-                .attribute("agent.mode", "PLAN")
-                .attribute("agent.input_chars", userRequest.length())) {
+        try (TraceScope runScope = tracing.start("coding.task")
+                .attribute("task.mode", "PLAN")
+                .attribute("task.input_chars", userRequest.length())) {
+            tracing.artifacts().beginTrace(
+                    runScope.traceId(), "PLAN", userRequest);
             logPlanStarted("PLAN", userRequest.length());
             try {
                 // ===== 阶段 1：初始规划 =====
@@ -199,8 +180,14 @@ public class PlanExecuteAgent {
                         null);
 
                 ExecutionPlan plan;
-                try {
-                    plan = planner.plan(userRequest);
+                try (TraceScope planScope = tracing.start("plan.create")) {
+                    try {
+                        plan = planner.plan(userRequest);
+                        planScope.attribute("plan.task.count", plan.size());
+                    } catch (Exception error) {
+                        planScope.fail(error);
+                        throw error;
+                    }
                 } catch (Exception e) {
                     if (isCancellation(e)) {
                         throw e;
@@ -265,21 +252,26 @@ public class PlanExecuteAgent {
                         plan);
                 return result;
             } catch (Exception error) {
+                boolean cancelled = isCancellation(error);
                 emitPlan(
-                        isCancellation(error)
+                        cancelled
                                 ? UiEvent.PlanPhase.CANCELLED
                                 : UiEvent.PlanPhase.FAILED,
                         stats.rounds,
                         stats.replans,
                         "",
-                        isCancellation(error)
+                        cancelled
                                 ? "计划已取消"
                                 : safeMessage(error),
                         null);
-                runScope.fail(error);
+                if (!cancelled) runScope.fail(error);
                 finishPlanRun(
-                        runScope, null, stats, "FAILED",
-                        "UNHANDLED_EXCEPTION", error);
+                        runScope,
+                        null,
+                        stats,
+                        cancelled ? "CANCELLED" : "FAILED",
+                        cancelled ? "USER_CANCELLED" : "UNHANDLED_EXCEPTION",
+                        error);
                 throw error;
             }
         }
@@ -293,10 +285,13 @@ public class PlanExecuteAgent {
      */
     public String resume(PlanStore.Checkpoint cp) throws Exception {
         PlanRunStats stats = new PlanRunStats();
+        stats.mode = "PLAN_RESUME";
 
-        try (TraceScope runScope = tracing.start("agent.run")
-                .attribute("agent.mode", "PLAN_RESUME")
-                .attribute("agent.input_chars", cp.userRequest().length())) {
+        try (TraceScope runScope = tracing.start("coding.task")
+                .attribute("task.mode", "PLAN_RESUME")
+                .attribute("task.input_chars", cp.userRequest().length())) {
+            tracing.artifacts().beginTrace(
+                    runScope.traceId(), "PLAN_RESUME", cp.userRequest());
             logPlanStarted("PLAN_RESUME", cp.userRequest().length());
             try {
                 ExecutionPlan plan = cp.plan();
@@ -326,21 +321,26 @@ public class PlanExecuteAgent {
                         plan);
                 return result;
             } catch (Exception error) {
+                boolean cancelled = isCancellation(error);
                 emitPlan(
-                        isCancellation(error)
+                        cancelled
                                 ? UiEvent.PlanPhase.CANCELLED
                                 : UiEvent.PlanPhase.FAILED,
                         stats.rounds,
                         stats.replans,
                         "",
-                        isCancellation(error)
+                        cancelled
                                 ? "计划已取消"
                                 : safeMessage(error),
                         cp.plan());
-                runScope.fail(error);
+                if (!cancelled) runScope.fail(error);
                 finishPlanRun(
-                        runScope, cp.plan(), stats, "FAILED",
-                        "UNHANDLED_EXCEPTION", error);
+                        runScope,
+                        cp.plan(),
+                        stats,
+                        cancelled ? "CANCELLED" : "FAILED",
+                        cancelled ? "USER_CANCELLED" : "UNHANDLED_EXCEPTION",
+                        error);
                 throw error;
             }
         }
@@ -362,11 +362,7 @@ public class PlanExecuteAgent {
             PlanRunStats stats)
             throws Exception {
         if (hasInterruptedTasks(plan)) {
-            /*
-             * Safety belongs to the execution layer, not only the CLI.
-             * Direct API callers therefore cannot bypass the non-replayable
-             * checkpoint guard.
-             */
+            /* 不可重放检查属于执行层安全边界，直接调用 API 也不能绕过。 */
             stats.replans = replanCount;
             stats.stopReason = "UNCERTAIN_TASK_STATE";
             return buildReport(plan, 0, replanCount);
@@ -440,9 +436,8 @@ public class PlanExecuteAgent {
                         plan);
             }
             /*
-             * Persist "started" before submitting workers. If the process
-             * dies after a side effect but before result collection, load()
-             * will classify the step as interrupted instead of replaying it.
+             * 提交 Worker 前先持久化“已启动”。即使进程在产生副作用后、收集结果前退出，
+             * 恢复时也会把该步骤判为中断，而不是重新执行。
              */
             checkpointRequired(userRequest, replanCount, plan);
 
@@ -481,12 +476,7 @@ public class PlanExecuteAgent {
                                                     taskTimeoutMillis)));
                 }
 
-                /*
-                 * Collect in actual completion order. Unlike
-                 * CompletableFuture.orTimeout, these are the real executor
-                 * Futures, so a timeout can interrupt the underlying worker
-                 * and cancel its task-scoped token.
-                 */
+                /* 按真实完成顺序收集执行器 Future，使超时能中断底层 Worker 并取消任务级令牌。 */
                 while (!running.isEmpty()) {
                     ensureNotInterrupted();
                     long waitStartedAt = System.nanoTime();
@@ -562,10 +552,8 @@ public class PlanExecuteAgent {
 
             } catch (Exception error) {
                 /*
-                 * A cancelled batch must never be persisted with tasks stuck
-                 * in IN_PROGRESS. Completed results already consumed above
-                 * remain terminal; uncertain work is never replayed
-                 * automatically because it may already have side effects.
+                 * 批次取消后不能留下 IN_PROGRESS：已收集的结果保持终态，
+                 * 状态不确定的任务可能已有副作用，因此不得自动重放。
                  */
                 markInterruptedTasks(plan);
                 checkpoint(userRequest, replanCount, plan);
@@ -585,9 +573,8 @@ public class PlanExecuteAgent {
 
             if (hasInterruptedTasks(plan)) {
                 /*
-                 * Timeout/cancellation has unknown external state. Replanning
-                 * could execute the same mutation a second time, so stop at
-                 * the durable checkpoint and require explicit inspection.
+                 * 超时或取消后的外部状态未知；重规划可能重复执行同一修改，
+                 * 因此停在持久化检查点，等待人工核验。
                  */
                 stats.stopReason = "UNCERTAIN_TASK_STATE";
                 break;
@@ -634,7 +621,7 @@ public class PlanExecuteAgent {
 
     /** 记录整次 Plan 的入口；正文只输出到交互终端，不进入日志。 */
     private static void logPlanStarted(String mode, int inputChars) {
-        logger.atInfo()
+        logger.atDebug()
                 .addKeyValue("event", "plan.run.started")
                 .addKeyValue("mode", mode)
                 .addKeyValue("input_chars", inputChars)
@@ -642,7 +629,7 @@ public class PlanExecuteAgent {
     }
 
     /** 结束整次 Plan，并将最终状态和累计统计同时写入 Span 与日志。 */
-    private static void finishPlanRun(
+    private void finishPlanRun(
             TraceScope scope,
             ExecutionPlan plan,
             PlanRunStats stats,
@@ -661,7 +648,7 @@ public class PlanExecuteAgent {
         if ("FAILED".equals(outcome) && error == null) {
             scope.error(stopReason, stopReason);
         }
-        scope.attribute("agent.outcome", outcome)
+        scope.attribute("task.outcome", outcome)
                 .attribute("plan.stop_reason", stopReason)
                 .attribute("plan.task.count", taskCount)
                 .attribute("plan.completed_task_count", completedTasks)
@@ -682,22 +669,31 @@ public class PlanExecuteAgent {
                         "plan.worker_tool_call_count",
                         stats.workerToolCalls)
                 .attribute(
-                        "gen_ai.input_tokens",
+                        "agent.usage.input_tokens",
                         stats.workerInputTokens)
                 .attribute(
-                        "gen_ai.output_tokens",
+                        "agent.usage.output_tokens",
                         stats.workerOutputTokens);
+
+        tracing.metrics().recordTask(
+                stats.mode,
+                outcome,
+                scope.elapsedMillis());
+        tracing.artifacts().completeTrace(
+                scope.traceId(), outcome, stats.recoveredErrors > 0);
 
         var event = switch (outcome) {
             case "SUCCESS" -> logger.atInfo();
-            case "DEGRADED" -> logger.atWarn();
+            case "DEGRADED", "CANCELLED" -> logger.atWarn();
             default -> logger.atError();
         };
-        event.addKeyValue(
-                        "event",
-                        "FAILED".equals(outcome)
-                                ? "plan.run.failed"
-                                : "plan.run.completed")
+        String eventName = switch (outcome) {
+            case "FAILED" -> "coding.task.failed";
+            case "CANCELLED" -> "coding.task.cancelled";
+            default -> "coding.task.completed";
+        };
+        event.addKeyValue("event", eventName)
+                .addKeyValue("mode", stats.mode)
                 .addKeyValue("outcome", outcome)
                 .addKeyValue("stop_reason", stopReason)
                 .addKeyValue("task_count", taskCount)
@@ -746,7 +742,7 @@ public class PlanExecuteAgent {
                         .count();
     }
 
-    /** Best-effort terminal checkpoint; returns whether persistence succeeded. */
+    /** 尽力保存任务终态，并返回持久化是否成功。 */
     private boolean checkpoint(
             String userRequest,
             int replanCount,
@@ -757,9 +753,8 @@ public class PlanExecuteAgent {
     }
 
     /**
-     * A mutation may start only after its IN_PROGRESS state is durable.
-     * Otherwise a stale PENDING checkpoint could replay the same side effect
-     * after a crash.
+     * 可变操作只能在 {@code IN_PROGRESS} 已持久化后启动，否则崩溃留下的旧
+     * {@code PENDING} 检查点可能重复执行同一副作用。
      */
     private void checkpointRequired(
             String userRequest,
@@ -772,23 +767,13 @@ public class PlanExecuteAgent {
     }
 
     /**
-     * 重规划：保留已完成步骤，让 LLM 基于当前状态生成新的替代步骤。
-     *
-     * 做法：
-     *   1. 收集当前状态（完成、失败、待完成）
-     *   2. 拼一段 prompt 发给 LLM："前面 X 失败了，请规划新的后续步骤"
-     *   3. LLM 返回新的 Task 列表（id 用 task_r0, task_r1... 避免冲突）
-     *   4. 移除所有 PENDING Task，保留 COMPLETED + FAILED
-     *   5. 加入新 Task，用新的序号
-     *
-     * 为什么不移除 FAILED Task？
-     *   已失败的步骤保留在报告中，让用户知道历史发生了什么。
+     * 保留已完成和失败的历史任务，用模型生成替代后续步骤，并移除已经失效的待执行任务。
      */
     private ExecutionPlan replan(String userRequest, ExecutionPlan oldPlan) throws Exception {
         String context = oldPlan.buildContextForReplan();
         int nextIdx = oldPlan.nextReplanIndex();
 
-        // 拼重规划 prompt
+        // 将当前进度和失败信息组装为重规划 Prompt。
         String replanPrompt = """
                 你是一个任务规划专家。前面已经执行了部分步骤，但有步骤失败了。
                 请基于当前已完成的进度，重新规划后续步骤来完成原始任务。
@@ -806,7 +791,7 @@ public class PlanExecuteAgent {
 
                 请输出新的后续步骤 JSON：""".formatted(nextIdx, userRequest, context);
 
-        // 调 LLM 做重规划
+        // 请求模型生成替代任务。
         var messages = List.of(
                 new LlmClient.Message("system", Planner.PLANNER_SYSTEM_PROMPT),
                 new LlmClient.Message("user", replanPrompt)
@@ -818,10 +803,10 @@ public class PlanExecuteAgent {
                 json,
                 new com.fasterxml.jackson.core.type.TypeReference<List<Map<String, Object>>>() {});
 
-        // 移除所有 PENDING Task，保留 COMPLETED + FAILED
+        // 待执行任务已被替代；完成和失败任务保留用于报告与依赖引用。
         oldPlan.removePendingTasks();
 
-        // 加入新 Task
+        // 将替代任务追加到原任务图。
         for (Map<String, Object> item : taskList) {
             String id = (String) item.get("id");
             String desc = (String) item.get("description");
@@ -848,17 +833,7 @@ public class PlanExecuteAgent {
         return oldPlan;
     }
 
-    /**
-     * 为子 Task 构造提示词。
-     *
-     * 包含两部分：
-     *   1. 任务描述（"你要完成什么"）
-     *   2. 上下文（已完成 Task 的结果，让 LLM 知道前面干了什么）
-     *
-     * 为什么要把已完成 Task 的结果传进去？
-     *   比如 task_2 要在 task_1 创建的 pom.xml 基础上改依赖——
-     *   如果不知道 task_1 干了什么，它就得重新读文件，浪费 token。
-     */
+    /** 为子任务组装目标和已完成步骤摘要，减少 Worker 重复读取上下文。 */
     private String buildTaskPrompt(Task task, ExecutionPlan plan) {
         StringBuilder sb = new StringBuilder();
         sb.append("请完成以下子任务：\n\n");
@@ -895,7 +870,7 @@ public class PlanExecuteAgent {
         return sb.toString();
     }
 
-    /** 汇总所有 Task 的执行结果 */
+    /** 汇总所有任务的最终状态和失败原因。 */
     private String buildReport(ExecutionPlan plan, int rounds, int replans) {
         StringBuilder sb = new StringBuilder();
         sb.append("\n===== 执行报告 =====\n");
@@ -945,14 +920,8 @@ public class PlanExecuteAgent {
     }
 
     /**
-     * 计划完整性校验。在真正执行前拒绝明显有问题的计划。
-     *
-     * 检查项：
-     *   1. 循环依赖（三色 DFS 检测）
-     *   2. 依赖了不存在的 task id
-     *   3. 空计划
-     *
-     * @return 非 null = 有问题（返回错误描述），null = 校验通过
+     * 执行前检查空计划、循环依赖和不存在的依赖。
+     * @return 校验通过时返回 {@code null}，否则返回错误说明
      */
     private String validate(ExecutionPlan plan) {
         // 空计划
@@ -988,6 +957,7 @@ public class PlanExecuteAgent {
      * <p>这里只累加 Worker 已经返回的统计，不调用 LLM，也不保存正文。</p>
      */
     private static final class PlanRunStats {
+        private String mode = "PLAN";
         private int rounds;
         private int replans;
         private int taskExecutions;
@@ -1153,11 +1123,10 @@ public class PlanExecuteAgent {
                     }
                     reviewFeedback = String.join("; ", review.issues());
                     if (stats.mutatingToolUsed) {
-                        /*
-                         * A fresh Agent would not know which external changes
-                         * the rejected attempt already made. Automatic redo
-                         * could repeat non-idempotent commands or writes.
-                         */
+                    /*
+                     * 新 Agent 不知道被驳回的尝试已修改了什么；自动重做可能重复执行
+                     * 非幂等命令或写入，因此有副作用时直接停止。
+                     */
                         recordTaskMetrics(taskScope, "FAILED", stats);
                         logTaskCompleted(taskScope, "FAILED", stats);
                         return taskResult(
@@ -1329,9 +1298,8 @@ public class PlanExecuteAgent {
         plan.updateTask(
                 result.taskId, result.status, result.result);
         /*
-         * Persist every terminal transition immediately. A sibling may still
-         * be running when Ctrl+C arrives; batch-only persistence would replay
-         * already completed side effects after restart.
+         * 每个终态都立即持久化。Ctrl+C 到来时兄弟任务可能仍在运行，若只在批次结束时保存，
+         * 重启后可能重放已经完成的副作用。
          */
         checkpoint(userRequest, replanCount, plan);
         stats.add(result);
@@ -1407,10 +1375,10 @@ public class PlanExecuteAgent {
                         "plan.task.recovered_error_count",
                         stats.recoveredErrors)
                 .attribute(
-                        "gen_ai.input_tokens",
+                        "agent.usage.input_tokens",
                         stats.workerInputTokens)
                 .attribute(
-                        "gen_ai.output_tokens",
+                        "agent.usage.output_tokens",
                         stats.workerOutputTokens);
     }
 

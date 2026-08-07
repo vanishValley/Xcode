@@ -15,17 +15,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * 会话持久化 —— 重启后恢复对话上下文。
- *
- * 设计要点：
- *   1. 每个项目一个会话文件，通过项目路径 hash 隔离
- *   2. JSONL 格式：每行一条 Message JSON，和 OpenAI 协议一致，人类可读
- *   3. 原子写入：先写 .tmp，再 rename，防止进程崩溃损坏文件
- *   4. 200 条上限：超出时截断保留最近 200 条（真正的语义压缩在 ConversationCompactor）
- *
- * 为什么用文件而不是数据库？
- *   对标 Claude Code / PaiCLI 的设计哲学——文件人类可读、
- *   可以直接编辑、不依赖额外驱动。
+ * 按项目持久化可恢复的对话历史。每行保存一条 Message JSON，写入使用原子替换；
+ * 单文件最多保留最近 200 条消息，语义压缩由 ConversationCompactor 负责。
  */
 public class SessionStore {
 
@@ -48,7 +39,7 @@ public class SessionStore {
         this.sessionsDir = sessionsDir;
     }
 
-    /** 主构造：从 XcodePaths 拿项目数据路径，hash/标准化等全部归 XcodePaths 管 */
+    /** 使用 XcodePaths 已计算好的项目数据目录。 */
     public SessionStore(com.xu.config.XcodePaths paths) {
         this(paths.projectDataDir());
     }

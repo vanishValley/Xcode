@@ -3,10 +3,9 @@ package com.xu.ui;
 import java.util.function.Consumer;
 
 /**
- * Prevents secrets split across SSE chunks from bypassing redaction.
+ * 防止被拆分到多个 SSE 片段中的凭据绕过脱敏。
  *
- * <p>Complete lines are released while streaming; the unfinished line stays
- * buffered until another newline or completion.</p>
+ * <p>流式阶段只释放完整行；未结束的行保留到收到换行或流结束后再处理。</p>
  */
 public final class StreamingDisplaySanitizer {
 

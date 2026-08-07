@@ -11,24 +11,14 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Skill 注册表 —— 三层扫描 + 同名覆盖 + 启用过滤 + 热重载。
+ * 负责 Skill 的发现、同名覆盖、启用过滤和热重载。
  *
- * 三层优先级(低 → 高):
- *   ① builtin  jar 内置 classpath:skills/
- *   ② user     ~/.xcode/skills/
- *   ③ project  <项目>/.xcode/skills/
- *
- * 同 name 的 skill, 后加载的覆盖前面的(put 覆盖语义)。
- * 因此 project 覆盖 user 覆盖 builtin —— 和 Git config / ESLint 同一模式。
- *
- * Registry 只负责“发现和覆盖”，不负责决定何时使用 Skill。是否命中
- * web-access 由 Agent 根据 system prompt 中的轻量索引自行判断。
- *
- * reload() 全量重建 —— 不设缓存, 每次重扫就是最新状态。
+ * <p>加载优先级为内置、用户级、项目级，后者覆盖前者。注册表不判断任务应使用哪个
+ * Skill，只向 Agent 提供轻量索引和按名称查询能力。</p>
  */
 public class SkillRegistry {
 
-    /** 最多启用多少 skill(防止索引段撑爆 system prompt) */
+    /** 限制注入 Prompt 的 Skill 数量，避免索引占用过多上下文。 */
     private static final int MAX_ENABLED_SKILLS = 20;
 
     private final XcodePaths paths;
@@ -40,18 +30,7 @@ public class SkillRegistry {
     }
 
     /**
-     * 三层全量扫描, 清除旧的 Map 重建。
-     *
-     * 为什么加 synchronized:
-     *   现在只启动时调一次, 确实没有并发。但后面做 /skill reload 时——
-     *   用户敲命令的同时, Agent.run() 可能正在 buildSkillIndex() 遍历 skills Map。
-     *   一个线程在 clear+putAll 重建 Map, 另一个线程在 forEach 遍历 ——
-     *   遍历到一半 Map 被清空了 → ConcurrentModificationException。
-     *
-     *   LinkedHashMap 不是并发安全的, 且"先 clear 再逐个 put"不是原子操作。
-     *   synchronized 把 reload() 和未来的所有读方法包在同一把锁上,
-     *   保证 reload 期间不会有读者看到半成品 Map。
-     *   (现在没有并发读者, 先写上, 不做过度优化)
+     * 全量重建三层注册表。同步锁避免热重载与并发查询同时访问非线程安全的 LinkedHashMap。
      */
     public synchronized void reload() {
         skills.clear();

@@ -8,7 +8,7 @@ import java.io.PrintWriter;
 import java.util.Optional;
 import java.util.Scanner;
 
-/** Blocking, dependency-light CLI used for pipes, IDE consoles and fallback. */
+/** 面向管道、IDE 控制台和降级场景的阻塞式轻量 CLI。 */
 public final class PlainCliApplication {
 
     private final Scanner scanner;

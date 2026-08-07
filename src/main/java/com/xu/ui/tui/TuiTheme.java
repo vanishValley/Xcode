@@ -2,7 +2,7 @@ package com.xu.ui.tui;
 
 import org.jline.utils.AttributedStyle;
 
-/** Theme-safe 16-color palette; status never relies on color alone. */
+/** 兼容不同终端主题的 16 色调色板；状态信息不只依赖颜色表达。 */
 final class TuiTheme {
 
     static final AttributedStyle BRAND = AttributedStyle.DEFAULT

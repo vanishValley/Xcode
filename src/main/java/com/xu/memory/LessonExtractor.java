@@ -8,14 +8,8 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 自动沉淀:事后扫 transcript,检测"失败→修正→成功"模式,调 LLM 提炼一句话教训。
- *
- * 两级漏斗:
- *   ① 信号闸门 hasFailureThenSuccess()  — 扫 tool 消息,不调 LLM,O(n),零成本
- *   ② LLM 提炼 extract()               — 调一次 LLM,"有值得记的吗?没有说无"
- *
- * 入口:tryExtract() 一站式,提炼失败/返回"无"时静默跳过。
- * 调用方:PlanExecuteAgent(子任务完成后)+ Agent.run()(ReAct 返回前)。
+ * 从“工具失败→修正→成功”的执行记录中自动提炼经验。
+ * 先以线性扫描检测有效信号，命中后才调用一次 LLM；没有有效内容或提炼失败时静默跳过。
  */
 public final class LessonExtractor {
 
@@ -24,8 +18,7 @@ public final class LessonExtractor {
     // ── ① 信号闸门 ──
 
     /**
-     * 扫 history 里的 tool 消息,判断是否有"同一个工具先出错、后成功"的模式。
-     * 不调 LLM,纯字符串扫描,微秒级。
+     * 扫描工具消息，判断同组调用是否出现“先失败、后成功”，此阶段不调用 LLM。
      */
     public static boolean hasFailureThenSuccess(List<Message> history) {
         Set<String> errored = new HashSet<>(); // 哪些工具出过错
@@ -70,7 +63,7 @@ public final class LessonExtractor {
             if (lesson.endsWith("\"")) lesson = lesson.substring(0, lesson.length() - 1);
             return lesson.trim();
         } catch (Exception e) {
-            // best-effort:提炼失败当无事发生
+            // 经验提炼是附加能力，失败不影响主任务。
             return null;
         }
     }
@@ -97,7 +90,7 @@ public final class LessonExtractor {
                     MemorySource.AGENT,
                     0.9));
         } catch (Exception ignored) {
-            // best-effort:任何一步异常都不影响主流程
+            // 自动沉淀尽力执行，任何异常都不影响主流程。
         }
     }
 

@@ -2,6 +2,7 @@ package com.xu.tool.impl;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.xu.http.OkHttpCallExecutor;
 import com.xu.tool.Tool;
 import okhttp3.*;
 
@@ -87,7 +88,7 @@ public class WebSearchTool implements Tool {
 
         String respBody;
         try {
-            SearchResponse response = InterruptibleHttp.execute(
+            SearchResponse response = OkHttpCallExecutor.executeInterruptibly(
                     httpClient.newCall(request),
                     raw -> {
                         var bodyResponse = raw.body();
