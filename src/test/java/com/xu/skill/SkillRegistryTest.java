@@ -5,6 +5,8 @@ import com.xu.tool.ToolRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 
@@ -40,5 +42,31 @@ class SkillRegistryTest {
 
         assertTrue(result.contains("已加载 Skill: web-access"));
         assertTrue(result.contains("工具路由"));
+    }
+
+    @Test
+    void projectSkillShouldOverrideBuiltinSkillWithSameName() throws Exception {
+        Path skillDir = projectRoot.resolve(".xcode/skills/web-access");
+        Files.createDirectories(skillDir);
+        Files.writeString(skillDir.resolve("SKILL.md"), """
+                ---
+                name: web-access
+                description: 当前项目自定义的联网工作流。
+                version: "1.0.0"
+                tags: [web, project]
+                ---
+
+                # Project Web Access
+
+                使用当前项目约定的联网流程。
+                """, StandardCharsets.UTF_8);
+
+        SkillRegistry skills = new SkillRegistry(new XcodePaths(projectRoot));
+        skills.reload();
+
+        Skill webAccess = skills.findSkill("web-access").orElseThrow();
+        assertEquals(Skill.Source.PROJECT, webAccess.source());
+        assertEquals("当前项目自定义的联网工作流。", webAccess.description());
+        assertTrue(webAccess.body().contains("Project Web Access"));
     }
 }

@@ -1,0 +1,24 @@
+{
+  "id": "feature-02-errors",
+  "family": "errors",
+  "category": "FEATURE",
+  "difficulty": "easy",
+  "split": "holdout",
+  "prompt": "HTTP 错误映射新增：IllegalArgumentException 映射 400，NoSuchElementException 映射 404，其他异常 500；连续解包 CompletionException 和 ExecutionException，直到没有 cause 或不是包装异常。",
+  "files": {
+    "Errors.java": "public class Errors { public static int status(Throwable e){return 500;} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert Errors.status(new IllegalStateException())==500;\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Errors.java": "public class Errors { public static int status(Throwable e){while((e instanceof java.util.concurrent.CompletionException||e instanceof java.util.concurrent.ExecutionException)&&e.getCause()!=null)e=e.getCause();if(e instanceof IllegalArgumentException)return 400;if(e instanceof java.util.NoSuchElementException)return 404;return 500;} }\n"
+  },
+  "editable": [
+    "Errors.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    assert Errors.status(new IllegalArgumentException())==400;assert Errors.status(new java.util.NoSuchElementException())==404;assert Errors.status(new java.util.concurrent.CompletionException(new java.util.concurrent.ExecutionException(new IllegalArgumentException())))==400;\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert Errors.status(new IllegalStateException())==500;\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

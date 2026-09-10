@@ -1,0 +1,14 @@
+{
+  "suite": "runtime-contracts-v1",
+  "provenance": "DETERMINISTIC_JUNIT: runtime invariants, not model capability scores",
+  "cases": [
+    {"id":"protocol-pairing","testClass":"AgentRecoveryTest","purpose":"中断工具批次后补齐未开始调用的结果，避免协议残缺"},
+    {"id":"preserve-side-effects","testClass":"AgentRecoveryTest","purpose":"工具成功后模型请求取消，保留完成证据"},
+    {"id":"plan-timeout","testClass":"PlanExecuteAgentTimeoutTest","purpose":"计划步骤超时与恢复边界"},
+    {"id":"tool-executor","testClass":"ToolExecutorTest","purpose":"工具异常、结果类型与执行协议"},
+    {"id":"cancel-generation","testClass":"CancellationTokenTest","purpose":"取消信号按运行代际隔离"},
+    {"id":"context-compaction","testClass":"ConversationCompactorTest","purpose":"压缩保持消息协议和上下文边界"},
+    {"id":"team-runtime","testClass":"TeamRuntimeTest","purpose":"团队成员生命周期、并发与停止"},
+    {"id":"team-coordination","testClass":"TeamCoordinatorTest","purpose":"团队编排与收尾"}
+  ]
+}

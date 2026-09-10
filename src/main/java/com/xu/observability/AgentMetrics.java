@@ -6,9 +6,10 @@ import io.opentelemetry.api.metrics.LongHistogram;
 import io.opentelemetry.api.metrics.Meter;
 
 /**
- * Coding Agent 的低基数运行指标。
+ * 记录 Coding Agent 的总体运行数据，例如任务数、调用耗时、Token 和工具调用次数。
  *
- * <p>指标刻意排除 Trace 和任务标识，只描述总体运行情况；单次执行通过链路追踪排查。</p>
+ * <p>指标回答“最近整体是否变慢、失败是否增多”；单次任务为什么失败则通过 Span
+ * 和日志排查。这里不记录 trace_id、task_id 等每次都不同的值，避免指标维度过多。</p>
  */
 public final class AgentMetrics {
 
@@ -22,6 +23,7 @@ public final class AgentMetrics {
     private final LongCounter toolCallCount;
     private final LongHistogram toolCallDuration;
 
+    /** 创建一个不记录任何指标的空实现，供 Tracing.noop() 使用。 */
     private AgentMetrics() {
         taskCount = null;
         taskDuration = null;
@@ -32,6 +34,11 @@ public final class AgentMetrics {
         toolCallDuration = null;
     }
 
+    /**
+     * 应用启动时调用，通过 OpenTelemetry Meter 创建项目需要的计数器和耗时分布。
+     *
+     * @param meter OpenTelemetry 的指标创建器
+     */
     AgentMetrics(Meter meter) {
         taskCount = meter.counterBuilder("coding.task.count")
                 .setDescription("Completed Coding Agent tasks")
@@ -65,10 +72,18 @@ public final class AgentMetrics {
                 .build();
     }
 
+    /** 返回不记录数据的指标对象，让业务代码无需判断指标功能是否开启。 */
     static AgentMetrics noop() {
         return NOOP;
     }
 
+    /**
+     * 一个完整 Coding Task 结束时调用，同时记录任务次数和端到端耗时。
+     *
+     * @param mode 执行模式，例如 agent 或 plan
+     * @param outcome 执行结果，例如 SUCCESS 或 FAILED
+     * @param durationMillis 整个任务的毫秒耗时
+     */
     public void recordTask(
             String mode,
             String outcome,
@@ -82,6 +97,15 @@ public final class AgentMetrics {
         taskDuration.record(Math.max(0L, durationMillis), attributes);
     }
 
+    /**
+     * 每次 LLM 请求结束时调用，记录调用次数、耗时以及输入输出 Token。
+     *
+     * @param model 本次请求使用的模型
+     * @param outcome 请求结果
+     * @param durationMillis 请求毫秒耗时
+     * @param inputTokens 输入 Token 数
+     * @param outputTokens 输出 Token 数
+     */
     public void recordLlm(
             String model,
             String outcome,
@@ -98,6 +122,14 @@ public final class AgentMetrics {
         recordTokens(inputTokens, outputTokens);
     }
 
+    /**
+     * 每次本地工具或 MCP 工具调用结束时调用，记录次数、耗时和结果类型。
+     *
+     * @param category 工具类别，例如 local 或 mcp
+     * @param outcome 调用结果
+     * @param errorType 失败类型；成功时通常为空
+     * @param durationMillis 工具调用的毫秒耗时
+     */
     public void recordTool(
             String category,
             String outcome,
@@ -113,6 +145,7 @@ public final class AgentMetrics {
         toolCallDuration.record(Math.max(0L, durationMillis), attributes);
     }
 
+    /** 把输入和输出 Token 分成两个类型写入同一个 Token 计数器。 */
     private void recordTokens(
             long inputTokens,
             long outputTokens) {
@@ -125,6 +158,7 @@ public final class AgentMetrics {
                 .build());
     }
 
+    /** 指标属性为空时统一使用 unknown，避免导出缺少维度的数据。 */
     private static String value(String value) {
         return value == null || value.isBlank() ? "unknown" : value;
     }

@@ -254,6 +254,10 @@ public final class Main {
                     Path.of(System.getProperty("xcode.log.dir"))
                             .resolve("xcode.log"));
 
+            commands.setTeamCoordinator(new com.xu.team.TeamCoordinator(
+                    client, registry, longTermMemory, skills, paths.projectRoot(),
+                    projectDataDir, tracing, events, cancellation));
+
             if (rich) {
                 terminal.writer().print('\r');
                 terminal.puts(InfoCmp.Capability.clr_eol);

@@ -1,0 +1,24 @@
+{
+  "id": "refactor-01-csv",
+  "family": "csv",
+  "category": "REFACTOR",
+  "difficulty": "hard",
+  "split": "dev",
+  "prompt": "替换 CSV 单行解析：支持引号包围字段、字段内逗号、双引号转义（两个双引号表示一个）、末尾空字段；不处理换行。空行解析为一个空字段；引号不配对抛 IllegalArgumentException。",
+  "files": {
+    "Csv.java": "import java.util.*;\npublic class Csv {public static List<String> parse(String line){return Arrays.asList(line.split(\",\"));}}\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert Csv.parse(\"a,b,c\").equals(List.of(\"a\",\"b\",\"c\"));\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Csv.java": "import java.util.*;\npublic class Csv {public static List<String> parse(String line){var result=new ArrayList<String>();var field=new StringBuilder();boolean quoted=false;for(int i=0;i<line.length();i++){char c=line.charAt(i);if(c=='\"'){if(quoted&&i+1<line.length()&&line.charAt(i+1)=='\"'){field.append('\"');i++;}else quoted=!quoted;}else if(c==','&&!quoted){result.add(field.toString());field.setLength(0);}else field.append(c);}if(quoted)throw new IllegalArgumentException();result.add(field.toString());return result;}}\n"
+  },
+  "editable": [
+    "Csv.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    assert Csv.parse(\"\\\"a,b\\\",c,\").equals(List.of(\"a,b\",\"c\",\"\"));assert Csv.parse(\"\\\"a\\\"\\\"b\\\",x\").equals(List.of(\"a\\\"b\",\"x\"));assert Csv.parse(\"\").equals(List.of(\"\"));try{Csv.parse(\"\\\"abc\");throw new AssertionError();}catch(IllegalArgumentException expected){}\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert Csv.parse(\"a,b,c\").equals(List.of(\"a\",\"b\",\"c\"));\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

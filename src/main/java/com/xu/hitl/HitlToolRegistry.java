@@ -6,6 +6,8 @@ import com.xu.tool.ToolRegistry;
 import com.xu.util.CancellationToken;
 import com.xu.observability.TraceScope;
 import com.xu.observability.Tracing;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 
@@ -19,6 +21,9 @@ import java.util.Map;
  * 审批委托给 HitlHandler：plain 与 TUI 可以使用不同实现，本类不变。
  */
 public class HitlToolRegistry extends ToolRegistry {
+
+    private static final Logger logger =
+            LoggerFactory.getLogger(HitlToolRegistry.class);
 
     private final HitlHandler handler;
     private final CancellationToken cancellation;
@@ -79,13 +84,26 @@ public class HitlToolRegistry extends ToolRegistry {
                     Map<String, Object> arguments) throws Exception {
                 cancellation.throwIfCancellationRequested();
                 ApprovalResult result;
+                String dangerLevel =
+                        ApprovalPolicy.dangerLevel(original.name());
                 try (TraceScope scope = tracing.start("hitl.wait")
                         .attribute("tool.name", original.name())
-                        .attribute("hitl.danger_level",
-                                ApprovalPolicy.dangerLevel(original.name()))) {
+                        .attribute("hitl.danger_level", dangerLevel)) {
                     result = handler.requestApproval(
                             original.name(), arguments);
                     scope.attribute("hitl.decision", result.type().name());
+
+                    // 审批内容可能包含命令或源码，这里只记录决策和等待时间。
+                    var event = result.isApproved()
+                            ? logger.atInfo() : logger.atWarn();
+                    event.addKeyValue("event", "tool.approval.completed")
+                            .addKeyValue("tool_name", original.name())
+                            .addKeyValue("danger_level", dangerLevel)
+                            .addKeyValue("decision", result.type().name())
+                            .addKeyValue(
+                                    "approval_wait_ms",
+                                    scope.elapsedMillis())
+                            .log("工具审批完成");
                 }
                 cancellation.throwIfCancellationRequested();
 

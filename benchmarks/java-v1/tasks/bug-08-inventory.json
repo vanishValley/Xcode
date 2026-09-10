@@ -1,0 +1,24 @@
+{
+  "id": "bug-08-inventory",
+  "family": "inventory",
+  "category": "BUG",
+  "difficulty": "hard",
+  "split": "dev",
+  "prompt": "预占库存只接受正整数；数量不足返回 false 且库存不变；非法数量抛 IllegalArgumentException；并发预占不能超卖。",
+  "files": {
+    "Stock.java": "public class Stock { private int available; public Stock(int n){available=n;} public boolean reserve(int n){available-=n;return available>=0;} public int available(){return available;} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    var stock=new Stock(5);assert stock.reserve(2);assert stock.available()==3;\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Stock.java": "public class Stock { private int available; public Stock(int n){available=n;} public synchronized boolean reserve(int n){if(n<=0)throw new IllegalArgumentException();if(n>available)return false;available-=n;return true;} public synchronized int available(){return available;} }\n"
+  },
+  "editable": [
+    "Stock.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var stock=new Stock(5);assert !stock.reserve(6);assert stock.available()==5;\n    try{stock.reserve(-2);throw new AssertionError();}catch(IllegalArgumentException expected){}\n    var pool=java.util.concurrent.Executors.newFixedThreadPool(8);var futures=new ArrayList<java.util.concurrent.Future<Boolean>>();for(int i=0;i<20;i++)futures.add(pool.submit(()->stock.reserve(1)));int ok=0;for(var f:futures)if(f.get())ok++;pool.shutdown();assert ok==5;assert stock.available()==0;\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    var stock=new Stock(5);assert stock.reserve(2);assert stock.available()==3;\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

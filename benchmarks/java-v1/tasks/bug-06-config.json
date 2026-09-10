@@ -1,0 +1,24 @@
+{
+  "id": "bug-06-config",
+  "family": "configuration",
+  "category": "BUG",
+  "difficulty": "easy",
+  "split": "holdout",
+  "prompt": "配置解析优先级：非空白环境变量 > 非空白配置文件值 > fallback。空字符串及全空白视为未设置；有效配置原样返回。",
+  "files": {
+    "Config.java": "import java.util.*;\npublic class Config { public static String resolve(String key,Map<String,String> env,Map<String,String> file,String fallback){return file.getOrDefault(key,env.getOrDefault(key,fallback));} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert Config.resolve(\"k\",Map.of(),Map.of(),\"d\").equals(\"d\");assert Config.resolve(\"k\",Map.of(),Map.of(\"k\",\"file\"),\"d\").equals(\"file\");\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Config.java": "import java.util.*;\npublic class Config { public static String resolve(String key,Map<String,String> env,Map<String,String> file,String fallback){String v=env.get(key);if(v!=null&&!v.isBlank())return v;v=file.get(key);return v!=null&&!v.isBlank()?v:fallback;} }\n"
+  },
+  "editable": [
+    "Config.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    assert Config.resolve(\"k\",Map.of(\"k\",\"env\"),Map.of(\"k\",\"file\"),\"d\").equals(\"env\");\n    assert Config.resolve(\"k\",Map.of(\"k\",\" \"),Map.of(\"k\",\"\"),\"d\").equals(\"d\");\n    assert Config.resolve(\"k\",Map.of(\"k\",\" \"),Map.of(\"k\",\"file\"),\"d\").equals(\"file\");\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert Config.resolve(\"k\",Map.of(),Map.of(),\"d\").equals(\"d\");assert Config.resolve(\"k\",Map.of(),Map.of(\"k\",\"file\"),\"d\").equals(\"file\");\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

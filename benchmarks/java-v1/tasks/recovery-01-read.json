@@ -1,0 +1,24 @@
+{
+  "id": "recovery-01-read",
+  "family": "pagination",
+  "category": "RECOVERY",
+  "difficulty": "medium",
+  "split": "dev",
+  "prompt": "修复零基分页：超过末页返回空列表；大页码不得整数溢出；返回值不能修改原列表；非法 page/size 抛 IllegalArgumentException。 本题 read_file 第一次调用会返回明确的临时失败（尚未读取），请正常处理工具失败。",
+  "files": {
+    "Pager.java": "import java.util.*;\npublic class Pager {\n  public static <T> List<T> page(List<T> rows, int page, int size) {\n    if (page < 0 || size <= 0) throw new IllegalArgumentException();\n    int from = page * size;\n    return rows.subList(from, Math.min(from + size, rows.size()));\n  }\n}\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert Pager.page(List.of(1,2,3),0,2).equals(List.of(1,2));\n    assert Pager.page(List.of(1,2,3),1,2).equals(List.of(3));\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Pager.java": "import java.util.*;\npublic class Pager {\n  public static <T> List<T> page(List<T> rows, int page, int size) {\n    if (page < 0 || size <= 0) throw new IllegalArgumentException();\n    long from = (long) page * size;\n    if (from >= rows.size()) return List.of();\n    return new ArrayList<>(rows.subList((int) from, (int) Math.min(from + size, rows.size())));\n  }\n}\n"
+  },
+  "editable": [
+    "Pager.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    assert Pager.page(List.of(1,2,3), 2, 2).isEmpty();\n    assert Pager.page(List.of(1), Integer.MAX_VALUE, 2).isEmpty();\n    var rows = new ArrayList<>(List.of(1,2,3)); var page = Pager.page(rows,0,2); page.clear(); assert rows.size()==3;\n    try { Pager.page(rows,-1,1); throw new AssertionError(); } catch (IllegalArgumentException expected) {}\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert Pager.page(List.of(1,2,3),0,2).equals(List.of(1,2));\n    assert Pager.page(List.of(1,2,3),1,2).equals(List.of(3));\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "read-once"
+}

@@ -1,0 +1,24 @@
+{
+  "id": "refactor-04-routing",
+  "family": "routing",
+  "category": "REFACTOR",
+  "difficulty": "hard",
+  "split": "dev",
+  "prompt": "路由匹配选择最长的路径前缀，且必须按完整路径段匹配；/api 不匹配 /apix；/ 可作为兜底；没有匹配返回 null；匹配不依赖 Map 遍历顺序。",
+  "files": {
+    "Router.java": "import java.util.*;\npublic class Router {public static String route(Map<String,String> routes,String path){return routes.entrySet().stream().filter(e->path.startsWith(e.getKey())).map(Map.Entry::getValue).findFirst().orElse(null);}}\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert Router.route(Map.of(\"/api\",\"api\"),\"/api/x\").equals(\"api\");assert Router.route(Map.of(\"/api\",\"api\"),\"/unknown\")==null;\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Router.java": "import java.util.*;\npublic class Router {public static String route(Map<String,String> routes,String path){return routes.entrySet().stream().filter(e->e.getKey().equals(\"/\")||path.equals(e.getKey())||path.startsWith(e.getKey()+\"/\")).max(Comparator.comparingInt(e->e.getKey().length())).map(Map.Entry::getValue).orElse(null);}}\n"
+  },
+  "editable": [
+    "Router.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var routes=new LinkedHashMap<String,String>();routes.put(\"/\",\"root\");routes.put(\"/api\",\"api\");routes.put(\"/api/orders\",\"orders\");assert Router.route(routes,\"/api/orders/1\").equals(\"orders\");assert Router.route(Map.of(\"/api\",\"api\"),\"/apix\")==null;assert Router.route(routes,\"/apix\").equals(\"root\");\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert Router.route(Map.of(\"/api\",\"api\"),\"/api/x\").equals(\"api\");assert Router.route(Map.of(\"/api\",\"api\"),\"/unknown\")==null;\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

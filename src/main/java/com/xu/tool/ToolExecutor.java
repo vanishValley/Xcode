@@ -91,12 +91,15 @@ public final class ToolExecutor {
         long startedAt = System.nanoTime();
         Map<String, Object> parsedArguments = Map.of();
         Map<String, Object> displayArguments = Map.of();
+        String operation = toolOperation(toolName);
+        String commandCategory = null;
 
         // 不记录参数正文，只记录长度，避免命令、源码或敏感数据进入日志。
         try (TraceScope scope = tracing.start("tool.execute")
                 .attribute("tool.name", toolName)
                 .attribute("tool.call_id", callId)
                 .attribute("tool.category", category)
+                .attribute("tool.operation", operation)
                 .attribute("tool.arguments_chars",
                         arguments == null ? 0L : arguments.length());
              var artifact = tracing.artifacts().beginOperation(
@@ -109,6 +112,10 @@ public final class ToolExecutor {
                                 arguments,
                                 new TypeReference<Map<String, Object>>() {});
                 displayArguments = SafeDisplay.arguments(parsedArguments);
+                commandCategory = commandCategory(toolName, parsedArguments);
+                if (commandCategory != null) {
+                    scope.attribute("command.category", commandCategory);
+                }
             } catch (Exception parseError) {
                 events.emit(new UiEvent.ToolStarted(
                         taskLabel, callId, toolName, Map.of()));
@@ -126,6 +133,8 @@ public final class ToolExecutor {
                         toolName,
                         callId,
                         errorType,
+                        operation,
+                        null,
                         scope.elapsedMillis(),
                         parseError);
                 emitCompleted(
@@ -144,6 +153,8 @@ public final class ToolExecutor {
                         toolName,
                         callId,
                         "TOOL_NOT_FOUND",
+                        operation,
+                        commandCategory,
                         scope.elapsedMillis(),
                         null);
                 ToolExecutionResult failure = ToolExecutionResult.failure(
@@ -196,6 +207,10 @@ public final class ToolExecutor {
                             "process.exit_code",
                             normalized.exitCode().longValue());
                 }
+                String testOutcome = testOutcome(commandCategory, normalized);
+                if (testOutcome != null) {
+                    scope.attribute("test.outcome", testOutcome);
+                }
 
                 if (normalized.success()) {
                     artifact.success(content);
@@ -211,6 +226,11 @@ public final class ToolExecutor {
                                     "result_chars", content.length())
                             .addKeyValue(
                                     "duration_ms", scope.elapsedMillis());
+                    addCodingFields(
+                            event,
+                            operation,
+                            commandCategory,
+                            testOutcome);
                     addProcessFields(event, normalized);
                     event.log("工具执行完成");
                     emitCompleted(
@@ -233,6 +253,9 @@ public final class ToolExecutor {
                         callId,
                         errorType,
                         normalized,
+                        operation,
+                        commandCategory,
+                        testOutcome,
                         scope.elapsedMillis());
                 emitCompleted(
                         callId,
@@ -256,6 +279,8 @@ public final class ToolExecutor {
                         toolName,
                         callId,
                         errorType,
+                        operation,
+                        commandCategory,
                         scope.elapsedMillis(),
                         error);
                 ToolExecutionResult failure = ToolExecutionResult.failure(
@@ -323,6 +348,9 @@ public final class ToolExecutor {
             String callId,
             String errorType,
             ToolExecutionResult result,
+            String operation,
+            String commandCategory,
+            String testOutcome,
             long durationMillis) {
         var event = result.timedOut()
                 ? logger.atError() : logger.atWarn();
@@ -335,6 +363,8 @@ public final class ToolExecutor {
                         result.content() == null
                                 ? 0 : result.content().length())
                 .addKeyValue("duration_ms", durationMillis);
+        addCodingFields(
+                event, operation, commandCategory, testOutcome);
         addProcessFields(event, result);
         event.log("工具报告执行失败");
     }
@@ -343,6 +373,8 @@ public final class ToolExecutor {
             String toolName,
             String callId,
             String errorType,
+            String operation,
+            String commandCategory,
             long durationMillis,
             Throwable error) {
         var event = logger.atError()
@@ -351,6 +383,8 @@ public final class ToolExecutor {
                 .addKeyValue("tool_call_id", callId)
                 .addKeyValue("error_type", errorType)
                 .addKeyValue("duration_ms", durationMillis);
+        addCodingFields(
+                event, operation, commandCategory, null);
         if (error != null) event.setCause(error);
         event.log("工具执行失败");
     }
@@ -362,6 +396,103 @@ public final class ToolExecutor {
             event.addKeyValue("exit_code", result.exitCode());
         }
         event.addKeyValue("timed_out", result.timedOut());
+    }
+
+    /** 给工具日志补充 Coding Agent 特有的低敏感度分类，不记录命令和文件正文。 */
+    private static void addCodingFields(
+            org.slf4j.spi.LoggingEventBuilder event,
+            String operation,
+            String commandCategory,
+            String testOutcome) {
+        event.addKeyValue("tool_operation", operation);
+        if (commandCategory != null) {
+            event.addKeyValue("command_category", commandCategory);
+        }
+        if (testOutcome != null) {
+            event.addKeyValue("test_outcome", testOutcome);
+        }
+    }
+
+    /** 把具体工具名归为稳定类别，便于按文件、命令、网络或 MCP 查询。 */
+    static String toolOperation(String toolName) {
+        if (toolName == null) return "other";
+        if (toolName.startsWith("mcp__")) return "mcp";
+        return switch (toolName) {
+            case "read_file", "glob_files", "list_dir" -> "file.read";
+            case "write_file" -> "file.write";
+            case "execute_command" -> "command.execute";
+            case "web_search", "web_fetch" -> "web.access";
+            case "load_skill" -> "skill.load";
+            default -> "other";
+        };
+    }
+
+    /**
+     * 只识别常见命令用途，不保存完整命令。无法确定时返回 OTHER，避免误报。
+     */
+    static String commandCategory(
+            String toolName,
+            Map<String, Object> arguments) {
+        if (!"execute_command".equals(toolName) || arguments == null) {
+            return null;
+        }
+        Object raw = arguments.get("command");
+        if (!(raw instanceof String command) || command.isBlank()) {
+            return "OTHER";
+        }
+        String value = command.strip().toLowerCase();
+        if (isTestCommand(value)) return "TEST";
+        if (value.startsWith("git ")) return "GIT";
+        if (value.startsWith("mvn ")
+                || value.startsWith("mvnw ")
+                || value.startsWith("./mvnw ")
+                || value.startsWith("gradle ")
+                || value.startsWith("./gradlew ")
+                || value.startsWith("npm run build")
+                || value.startsWith("pnpm build")
+                || value.startsWith("yarn build")
+                || value.startsWith("javac ")) {
+            return "BUILD";
+        }
+        return "OTHER";
+    }
+
+    /** 根据结构化执行结果给测试命令标记最终状态。 */
+    static String testOutcome(
+            String commandCategory,
+            ToolExecutionResult result) {
+        if (!"TEST".equals(commandCategory) || result == null) return null;
+        if (result.timedOut()) return "TIMEOUT";
+        return result.success() ? "PASSED" : "FAILED";
+    }
+
+    private static boolean isTestCommand(String command) {
+        boolean maven = command.startsWith("mvn ")
+                || command.startsWith("mvnw ")
+                || command.startsWith("./mvnw ");
+        boolean gradle = command.startsWith("gradle ")
+                || command.startsWith("./gradlew ");
+        return maven && hasCommandWord(command, "test", "verify")
+                || gradle && hasCommandWord(command, "test", "check")
+                || command.startsWith("npm test")
+                || command.startsWith("npm run test")
+                || command.startsWith("pnpm test")
+                || command.startsWith("yarn test")
+                || command.startsWith("pytest")
+                || command.startsWith("python -m pytest")
+                || command.startsWith("cargo test")
+                || command.startsWith("go test")
+                || command.startsWith("dotnet test");
+    }
+
+    private static boolean hasCommandWord(
+            String command,
+            String first,
+            String second) {
+        for (String token : command.split("\\s+")) {
+            if (first.equals(token) || second.equals(token)) return true;
+        }
+        return false;
     }
 
     private static String safeMessage(Throwable error) {

@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ToolExecutorTest {
@@ -136,6 +137,55 @@ class ToolExecutorTest {
         } finally {
             Thread.interrupted();
         }
+    }
+
+    @Test
+    void shouldClassifyCodingOperationsWithoutKeepingRawArguments() {
+        assertEquals("file.read", ToolExecutor.toolOperation("read_file"));
+        assertEquals("file.write", ToolExecutor.toolOperation("write_file"));
+        assertEquals(
+                "command.execute",
+                ToolExecutor.toolOperation("execute_command"));
+        assertEquals("mcp", ToolExecutor.toolOperation("mcp__server__tool"));
+
+        assertEquals(
+                "TEST",
+                ToolExecutor.commandCategory(
+                        "execute_command",
+                        Map.of("command", "mvn -q test")));
+        assertEquals(
+                "BUILD",
+                ToolExecutor.commandCategory(
+                        "execute_command",
+                        Map.of("command", "mvn package")));
+        assertEquals(
+                "GIT",
+                ToolExecutor.commandCategory(
+                        "execute_command",
+                        Map.of("command", "git status")));
+        assertNull(ToolExecutor.commandCategory("read_file", Map.of()));
+    }
+
+    @Test
+    void shouldDeriveTestOutcomeFromStructuredCommandResult() {
+        assertEquals(
+                "PASSED",
+                ToolExecutor.testOutcome(
+                        "TEST",
+                        ToolExecutionResult.command("ok", 0, false)));
+        assertEquals(
+                "FAILED",
+                ToolExecutor.testOutcome(
+                        "TEST",
+                        ToolExecutionResult.command("failed", 1, false)));
+        assertEquals(
+                "TIMEOUT",
+                ToolExecutor.testOutcome(
+                        "TEST",
+                        ToolExecutionResult.command("timeout", -1, true)));
+        assertNull(ToolExecutor.testOutcome(
+                "BUILD",
+                ToolExecutionResult.command("ok", 0, false)));
     }
 
     private static LlmClient.ToolCall call(

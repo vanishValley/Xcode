@@ -1,0 +1,31 @@
+{
+  "date": "2026-09-11",
+  "agentBinarySha256": "4cd34ab5ebc9ec19d7fa800de8f79da18c583019797e6da3f8880aff40f594fd",
+  "summary": {
+    "tasks": 20,
+    "trials": 20,
+    "eligible": 20,
+    "infraErrors": 0,
+    "passed": 20,
+    "pass1": 1.0,
+    "anySuccess": 1.0,
+    "allSuccess": 1.0,
+    "completeRepeatGroups": 20,
+    "p50Ms": 1263,
+    "p95Ms": 1436,
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "incompleteUsage": 20,
+    "statuses": {
+      "PASS": 20
+    },
+    "categoryPass1": {
+      "BUG": 1.0,
+      "CONSTRAINT": 1.0,
+      "FEATURE": 1.0,
+      "RECOVERY": 1.0,
+      "REFACTOR": 1.0
+    }
+  },
+  "provenance": "SCRIPTED_SMOKE: actual Agent/tool/grader execution through shared OpenTelemetry capture, no real model"
+}

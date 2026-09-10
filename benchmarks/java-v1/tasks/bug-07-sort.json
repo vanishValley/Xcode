@@ -1,0 +1,24 @@
+{
+  "id": "bug-07-sort",
+  "family": "sorting",
+  "category": "BUG",
+  "difficulty": "medium",
+  "split": "holdout",
+  "prompt": "按 score 降序、null score 放最后；分数相同时按 name 字典序升序；不得修改调用者列表。",
+  "files": {
+    "Ranking.java": "import java.util.*;\npublic class Ranking { public record Item(String name,Integer score){} public static List<Item> rank(List<Item> items){items.sort(Comparator.comparing(Item::score).reversed());return items;} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    var items=new ArrayList<>(List.of(new Ranking.Item(\"a\",1),new Ranking.Item(\"b\",3)));assert Ranking.rank(items).get(0).name().equals(\"b\");\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Ranking.java": "import java.util.*;\npublic class Ranking { public record Item(String name,Integer score){} public static List<Item> rank(List<Item> items){var out=new ArrayList<>(items);out.sort(Comparator.comparing(Item::score,Comparator.nullsLast(Comparator.reverseOrder())).thenComparing(Item::name));return out;} }\n"
+  },
+  "editable": [
+    "Ranking.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var items=List.of(new Ranking.Item(\"z\",null),new Ranking.Item(\"b\",8),new Ranking.Item(\"a\",8));\n    assert Ranking.rank(items).stream().map(Ranking.Item::name).toList().equals(List.of(\"a\",\"b\",\"z\"));\n    var mutable=new ArrayList<>(List.of(new Ranking.Item(\"x\",1),new Ranking.Item(\"y\",2)));Ranking.rank(mutable);assert mutable.get(0).name().equals(\"x\");\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    var items=new ArrayList<>(List.of(new Ranking.Item(\"a\",1),new Ranking.Item(\"b\",3)));assert Ranking.rank(items).get(0).name().equals(\"b\");\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

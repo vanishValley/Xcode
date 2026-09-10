@@ -1,0 +1,24 @@
+{
+  "id": "bug-05-retry",
+  "family": "retry",
+  "category": "BUG",
+  "difficulty": "easy",
+  "split": "dev",
+  "prompt": "重试条件：HTTP 408、429、500-599，且当前已执行次数 attempt 小于 maxAttempts；其他状态不重试。attempt 从 1 开始。",
+  "files": {
+    "RetryPolicy.java": "public class RetryPolicy { public static boolean shouldRetry(int status,int attempt,int maxAttempts){return status>=500 && attempt<=maxAttempts;} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert RetryPolicy.shouldRetry(503,1,3);assert !RetryPolicy.shouldRetry(200,1,3);\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "RetryPolicy.java": "public class RetryPolicy { public static boolean shouldRetry(int status,int attempt,int maxAttempts){return attempt<maxAttempts&&(status==408||status==429||(status>=500&&status<=599));} }\n"
+  },
+  "editable": [
+    "RetryPolicy.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    assert RetryPolicy.shouldRetry(429,1,3); assert RetryPolicy.shouldRetry(408,1,2);\n    assert !RetryPolicy.shouldRetry(503,3,3); assert !RetryPolicy.shouldRetry(600,1,3); assert !RetryPolicy.shouldRetry(404,1,3);\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert RetryPolicy.shouldRetry(503,1,3);assert !RetryPolicy.shouldRetry(200,1,3);\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

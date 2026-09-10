@@ -23,6 +23,7 @@ final class CommandCompleter implements Completer {
         ROOT_COMMANDS.put("/skills", "查看 Skills");
         ROOT_COMMANDS.put("/skill", "管理 Skill");
         ROOT_COMMANDS.put("/plan", "规划并执行复杂任务");
+        ROOT_COMMANDS.put("/team", "主 Agent 动态协调调查与验证");
         ROOT_COMMANDS.put("/save", "保存长期记忆");
         ROOT_COMMANDS.put("/memory", "查看或清空长期记忆");
         ROOT_COMMANDS.put("/history", "管理本地输入历史");

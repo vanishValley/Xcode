@@ -1,0 +1,24 @@
+{
+  "id": "refactor-03-resource",
+  "family": "resource",
+  "category": "REFACTOR",
+  "difficulty": "medium",
+  "split": "dev",
+  "prompt": "读取 Reader 的所有字符后返回字符串，无论读取成功或抛 IOException，都必须关闭传入 Reader；保留 IOException 向上传播，不转为成功。",
+  "files": {
+    "TextLoader.java": "import java.io.*;\npublic class TextLoader {public static String load(Reader reader)throws IOException{var out=new StringBuilder();int c;while((c=reader.read())!=-1)out.append((char)c);return out.toString();}}\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert TextLoader.load(new java.io.StringReader(\"hello\")).equals(\"hello\");assert TextLoader.load(new java.io.StringReader(\"\")).isEmpty();\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "TextLoader.java": "import java.io.*;\npublic class TextLoader {public static String load(Reader reader)throws IOException{try(reader){var out=new StringBuilder();char[] buffer=new char[128];int n;while((n=reader.read(buffer))!=-1)out.append(buffer,0,n);return out.toString();}}}\n"
+  },
+  "editable": [
+    "TextLoader.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var closed=new boolean[1];var reader=new java.io.Reader(){public int read(char[] b,int o,int l)throws java.io.IOException{throw new java.io.IOException(\"broken\");}public void close(){closed[0]=true;}};try{TextLoader.load(reader);throw new AssertionError();}catch(java.io.IOException expected){}assert closed[0];\n    var successfulClosed=new boolean[1];var good=new java.io.StringReader(\"ok\"){@Override public void close(){successfulClosed[0]=true;super.close();}};assert TextLoader.load(good).equals(\"ok\");assert successfulClosed[0];\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert TextLoader.load(new java.io.StringReader(\"hello\")).equals(\"hello\");assert TextLoader.load(new java.io.StringReader(\"\")).isEmpty();\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

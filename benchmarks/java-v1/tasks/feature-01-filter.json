@@ -1,0 +1,25 @@
+{
+  "id": "feature-01-filter",
+  "family": "orders",
+  "category": "FEATURE",
+  "difficulty": "medium",
+  "split": "dev",
+  "prompt": "订单查询新增可选 status 筛选：null/空白表示不过滤，否则区分大小写精确匹配；先筛选再分页；page 从 0 开始，越界返回空列表，非法参数抛 IllegalArgumentException。",
+  "files": {
+    "Order.java": "public record Order(String id,String status) {}\n",
+    "OrderService.java": "import java.util.*;\npublic class OrderService { public static List<Order> query(List<Order> orders,String status,int page,int size){int from=page*size;return orders.subList(from,Math.min(from+size,orders.size()));} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    var orders=List.of(new Order(\"1\",\"PAID\"),new Order(\"2\",\"NEW\"));assert OrderService.query(orders,null,0,1).equals(List.of(orders.get(0)));\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "OrderService.java": "import java.util.*;\npublic class OrderService { public static List<Order> query(List<Order> orders,String status,int page,int size){if(page<0||size<=0)throw new IllegalArgumentException();var filtered=orders.stream().filter(o->status==null||status.isBlank()||status.equals(o.status())).toList();long from=(long)page*size;if(from>=filtered.size())return List.of();return filtered.subList((int)from,(int)Math.min(from+size,filtered.size()));} }\n"
+  },
+  "editable": [
+    "OrderService.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var orders=List.of(new Order(\"1\",\"PAID\"),new Order(\"2\",\"NEW\"),new Order(\"3\",\"PAID\"));assert OrderService.query(orders,\"PAID\",1,1).get(0).id().equals(\"3\");assert OrderService.query(orders,\"X\",0,2).isEmpty();assert OrderService.query(orders,null,9,1).isEmpty();\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    var orders=List.of(new Order(\"1\",\"PAID\"),new Order(\"2\",\"NEW\"));assert OrderService.query(orders,null,0,1).equals(List.of(orders.get(0)));\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

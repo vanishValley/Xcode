@@ -47,6 +47,8 @@ public class LlmClient {
     private final ObjectMapper objectMapper;
     private final Tracing tracing;
     private final Set<Call> activeCalls = ConcurrentHashMap.newKeySet();
+    // 同一客户端可被多个成员使用，输出限制必须按调用线程隔离。
+    private final ThreadLocal<Integer> outputLimit = new ThreadLocal<>();
 
     public LlmClient(String apiKey, String model) {
         this(apiKey, model, Tracing.noop());
@@ -90,6 +92,7 @@ public class LlmClient {
             ExecutionArtifactStore.Operation artifact = null;
             try {
                 ChatRequest request = new ChatRequest(model, messages, false, tools);
+                request.maxTokens = outputLimit.get();
                 String json = objectMapper.writeValueAsString(request);
                 scope.attribute("llm.request_chars", json.length());
                 artifact = tracing.artifacts().beginOperation(
@@ -123,6 +126,8 @@ public class LlmClient {
                     Choice choice = chatResponse.choices.get(0);
                     scope.attribute("gen_ai.finish_reason", choice.finishReason);
                     choice.message.finishReason = choice.finishReason;
+                    scope.attribute("gen_ai.usage.complete", chatResponse.usage != null)
+                            .attribute("llm.tool_call_count", choice.message.toolCalls == null ? 0 : choice.message.toolCalls.size());
                     if (chatResponse.usage != null) {
                         choice.message.inputTokens =
                                 chatResponse.usage.promptTokens;
@@ -175,6 +180,14 @@ public class LlmClient {
                 if (artifact != null) artifact.close();
             }
         }
+    }
+
+    /** 有界调用仍通过可覆盖的 chatRaw，便于假模型测试和共享连接池。 */
+    public Message chatRaw(List<Message> messages, List<Map<String, Object>> tools, int maxOutputTokens) throws IOException {
+        Integer previous = outputLimit.get();
+        outputLimit.set(maxOutputTokens);
+        try { return chatRaw(messages, tools); }
+        finally { if (previous == null) outputLimit.remove(); else outputLimit.set(previous); }
     }
 
     /** 流式输出 assistant 文本，同时重组 ReAct 所需的完整消息和碎片化 Tool Call。 */
@@ -260,6 +273,8 @@ public class LlmClient {
                     scope.attribute(
                                     "gen_ai.finish_reason",
                                     result.finishReason)
+                            .attribute("gen_ai.usage.complete", accumulator.usage != null)
+                            .attribute("llm.tool_call_count", result.toolCalls == null ? 0 : result.toolCalls.size())
                             .attribute(
                                     "gen_ai.usage.input_tokens",
                                     result.inputTokens)
@@ -445,6 +460,9 @@ public class LlmClient {
     }
 
     static class ChatRequest {
+        @JsonProperty("max_tokens")
+        @JsonInclude(JsonInclude.Include.NON_NULL)
+        public Integer maxTokens;
         public String model;
         public List<Message> messages;
         public boolean stream = false;

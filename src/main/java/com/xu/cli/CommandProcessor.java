@@ -48,6 +48,12 @@ public final class CommandProcessor {
 
     private final Agent agent;
     private final PlanExecuteAgent planAgent;
+    private com.xu.team.TeamCoordinator teamCoordinator;
+
+    /** 可选装配，旧测试与普通模式构造保持兼容。 */
+    public void setTeamCoordinator(com.xu.team.TeamCoordinator coordinator) {
+        this.teamCoordinator = coordinator;
+    }
     private final HitlToolRegistry registry;
     private final MemoryManager memory;
     private final PlanStore planStore;
@@ -213,6 +219,14 @@ public final class CommandProcessor {
                         Kind.INFO,
                         "plain 模式不记录输入历史；"
                                 + "已有 TUI 历史请在 TUI 中运行 /history clear 清理。");
+            }
+            if (command.equals("/team") || command.startsWith("/team ")) {
+                String task = command.substring(5).strip();
+                if (task.isEmpty()) return Result.of(Kind.INFO, "用法：/team <任务描述>（主 Agent 协调只读成员调查，集中修改和验证）");
+                if (teamCoordinator == null) return Result.of(Kind.WARNING, "当前运行环境未装配 Team 模式");
+                String report = teamCoordinator.execute(task);
+                agent.recordExternalResult("/team " + task, report);
+                return Result.of(Kind.ASSISTANT, report);
             }
             if (command.startsWith("/plan")) {
                 String task = command.substring(5).strip();
@@ -393,6 +407,7 @@ public final class CommandProcessor {
                   /skill reload         重新扫描 Skills
                   /skill on|off <name>  启用或禁用 Skill
                   /plan <任务>          规划并并行执行复杂任务
+                  /team <任务>          主 Agent 动态委派调查、协调并验证
                   /save [-g] <事实>     保存长期记忆
                   /memory               查看长期记忆
                   /memory clear         清空长期记忆

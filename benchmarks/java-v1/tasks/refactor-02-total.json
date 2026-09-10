@@ -1,0 +1,28 @@
+{
+  "id": "refactor-02-total",
+  "family": "invoice",
+  "category": "REFACTOR",
+  "difficulty": "hard",
+  "split": "holdout",
+  "prompt": "修复发票总额：每行按原始 BigDecimal 单价乘数量，总和最后 HALF_UP 保留两位；两种入口 Invoice.total 与 InvoiceService.amount 必须结果一致，不能先舍入每行。",
+  "files": {
+    "Line.java": "import java.math.*;\npublic record Line(BigDecimal price,int quantity){}\n",
+    "Invoice.java": "import java.util.*;\nimport java.math.*;\npublic class Invoice {public static BigDecimal total(List<Line> lines){return lines.stream().map(l->l.price().multiply(BigDecimal.valueOf(l.quantity())).setScale(2,RoundingMode.HALF_UP)).reduce(BigDecimal.ZERO,BigDecimal::add).setScale(2);}}\n",
+    "InvoiceService.java": "import java.util.*;\nimport java.math.*;\npublic class InvoiceService {public BigDecimal amount(List<Line> lines){return BigDecimal.valueOf(lines.stream().mapToDouble(l->l.price().doubleValue()*l.quantity()).sum()).setScale(2,RoundingMode.HALF_UP);}}\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    var lines=List.of(new Line(new BigDecimal(\"2.50\"),2));assert Invoice.total(lines).equals(new BigDecimal(\"5.00\"));assert new InvoiceService().amount(lines).equals(Invoice.total(lines));\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Invoice.java": "import java.util.*;\nimport java.math.*;\npublic class Invoice {public static BigDecimal total(List<Line> lines){return lines.stream().map(l->l.price().multiply(BigDecimal.valueOf(l.quantity()))).reduce(BigDecimal.ZERO,BigDecimal::add).setScale(2,RoundingMode.HALF_UP);}}\n",
+    "InvoiceService.java": "import java.util.*;\nimport java.math.*;\npublic class InvoiceService {public BigDecimal amount(List<Line> lines){return Invoice.total(lines);}}\n"
+  },
+  "editable": [
+    "Invoice.java",
+    "InvoiceService.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var lines=List.of(new Line(new BigDecimal(\"0.004\"),1),new Line(new BigDecimal(\"0.004\"),1));assert Invoice.total(lines).equals(new BigDecimal(\"0.01\"));assert new InvoiceService().amount(lines).equals(Invoice.total(lines));var large=List.of(new Line(new BigDecimal(\"99999999999999.99\"),3));assert new InvoiceService().amount(large).equals(new BigDecimal(\"299999999999999.97\"));\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    var lines=List.of(new Line(new BigDecimal(\"2.50\"),2));assert Invoice.total(lines).equals(new BigDecimal(\"5.00\"));assert new InvoiceService().amount(lines).equals(Invoice.total(lines));\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

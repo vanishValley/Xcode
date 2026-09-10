@@ -1,0 +1,24 @@
+{
+  "id": "recovery-02-write",
+  "family": "ledger",
+  "category": "RECOVERY",
+  "difficulty": "medium",
+  "split": "dev",
+  "prompt": "同一个请求 key 重复入账不得重复增加余额；重复 key 携带不同金额时抛 IllegalArgumentException 且余额不变；保持线程安全。 本题 write_file 第一次调用会返回明确的临时失败（尚未写入），请正常处理工具失败。",
+  "files": {
+    "Ledger.java": "import java.util.*;\npublic class Ledger {\n private final Map<String,Integer> requests=new HashMap<>(); private int balance;\n public synchronized int credit(String key,int amount){ balance+=amount; requests.put(key,amount); return balance; }\n public synchronized int balance(){return balance;}\n}\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    var ledger = new Ledger(); assert ledger.credit(\"a\",10)==10; assert ledger.credit(\"b\",5)==15;\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Ledger.java": "import java.util.*;\npublic class Ledger {\n private final Map<String,Integer> requests=new HashMap<>(); private int balance;\n public synchronized int credit(String key,int amount){\n  if(requests.containsKey(key)){if(requests.get(key)!=amount)throw new IllegalArgumentException(); return balance;}\n  balance+=amount; requests.put(key,amount); return balance;\n }\n public synchronized int balance(){return balance;}\n}\n"
+  },
+  "editable": [
+    "Ledger.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var ledger = new Ledger(); ledger.credit(\"a\",10); ledger.credit(\"a\",10); assert ledger.balance()==10;\n    try { ledger.credit(\"a\",20); throw new AssertionError(); } catch(IllegalArgumentException expected){}\n    assert ledger.balance()==10;\n    var threads=new ArrayList<Thread>(); for(int i=0;i<12;i++){var t=new Thread(()->ledger.credit(\"b\",7));threads.add(t);t.start();} for(var t:threads)t.join(); assert ledger.balance()==17;\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    var ledger = new Ledger(); assert ledger.credit(\"a\",10)==10; assert ledger.credit(\"b\",5)==15;\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "write-once"
+}

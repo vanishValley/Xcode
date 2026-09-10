@@ -1,0 +1,24 @@
+{
+  "id": "feature-04-batch",
+  "family": "batch",
+  "category": "FEATURE",
+  "difficulty": "medium",
+  "split": "holdout",
+  "prompt": "批处理需要逐项执行 Consumer；单项抛 RuntimeException 时记录原输入并继续，返回失败项列表；成功时返回空列表；保留失败项顺序，不能吞掉 Error。",
+  "files": {
+    "Batch.java": "import java.util.*;\nimport java.util.function.*;\npublic class Batch { public static <T> List<T> run(List<T> input,Consumer<T> action){input.forEach(action);return List.of();} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    var seen=new ArrayList<Integer>();assert Batch.run(List.of(1,2),seen::add).isEmpty();assert seen.equals(List.of(1,2));\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Batch.java": "import java.util.*;\nimport java.util.function.*;\npublic class Batch { public static <T> List<T> run(List<T> input,Consumer<T> action){var failed=new ArrayList<T>();for(T item:input){try{action.accept(item);}catch(RuntimeException e){failed.add(item);}}return failed;} }\n"
+  },
+  "editable": [
+    "Batch.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var seen=new ArrayList<Integer>();var failed=Batch.run(List.of(1,2,3,4),n->{if(n%2==0)throw new IllegalArgumentException();seen.add(n);});assert failed.equals(List.of(2,4));assert seen.equals(List.of(1,3));\n    try{Batch.run(List.of(1),n->{throw new AssertionError(\"fatal\");});throw new IllegalStateException();}catch(AssertionError expected){}\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    var seen=new ArrayList<Integer>();assert Batch.run(List.of(1,2),seen::add).isEmpty();assert seen.equals(List.of(1,2));\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

@@ -1,0 +1,24 @@
+{
+  "id": "bug-02-money",
+  "family": "money",
+  "category": "BUG",
+  "difficulty": "medium",
+  "split": "dev",
+  "prompt": "金额以十进制字符串输入；将单价乘数量后的总金额按 HALF_UP 保留两位小数，禁止先把单价舍入。保留静态方法签名。",
+  "files": {
+    "Pricing.java": "import java.math.*;\npublic class Pricing { public static BigDecimal total(String price,int quantity) { return new BigDecimal(Double.parseDouble(price) * quantity).setScale(2,RoundingMode.HALF_UP); } }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert Pricing.total(\"12.50\",2).equals(new BigDecimal(\"25.00\"));\n    assert Pricing.total(\"0\",0).equals(new BigDecimal(\"0.00\"));\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Pricing.java": "import java.math.*;\npublic class Pricing { public static BigDecimal total(String price,int quantity) { return new BigDecimal(price).multiply(BigDecimal.valueOf(quantity)).setScale(2,RoundingMode.HALF_UP); } }\n"
+  },
+  "editable": [
+    "Pricing.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    assert Pricing.total(\"1.005\",1).equals(new BigDecimal(\"1.01\"));\n    assert Pricing.total(\"0.335\",3).equals(new BigDecimal(\"1.01\"));\n    assert Pricing.total(\"99999999999999.99\",3).equals(new BigDecimal(\"299999999999999.97\"));\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert Pricing.total(\"12.50\",2).equals(new BigDecimal(\"25.00\"));\n    assert Pricing.total(\"0\",0).equals(new BigDecimal(\"0.00\"));\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

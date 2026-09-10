@@ -26,15 +26,20 @@ class MemoryManagerPromptTest {
         memory.setContext("【Plan上下文】已经读取 pom.xml");
         memory.beginTask("升级 okhttp");
 
-        List<Message> prompt = memory.assemblePrompt(List.of(
-                new Message("system", "基础提示词\nSkill索引"),
-                new Message("user", "升级 okhttp")));
+        List<Message> history = List.of(
+                new Message("system", "基础提示词"),
+                new Message("user", "升级 okhttp"));
+        List<Message> prompt = memory.assemblePrompt(
+                history,
+                "Skill索引");
 
-        assertEquals("基础提示词\nSkill索引", prompt.get(0).content);
-        assertTrue(prompt.get(1).content.contains("当前目标"));
-        assertTrue(prompt.get(2).content.contains("相关记忆"));
-        assertTrue(prompt.get(3).content.contains("Plan上下文"));
-        assertEquals("user", prompt.get(4).role);
+        assertEquals("基础提示词", prompt.get(0).content);
+        assertEquals("Skill索引", prompt.get(1).content);
+        assertTrue(prompt.get(2).content.contains("当前目标"));
+        assertTrue(prompt.get(3).content.contains("相关记忆"));
+        assertTrue(prompt.get(4).content.contains("Plan上下文"));
+        assertEquals("user", prompt.get(5).role);
+        assertEquals(2, history.size(), "临时索引不应污染原始历史");
     }
 
     @Test

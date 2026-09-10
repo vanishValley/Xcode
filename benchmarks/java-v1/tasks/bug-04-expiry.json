@@ -1,0 +1,24 @@
+{
+  "id": "bug-04-expiry",
+  "family": "expiry",
+  "category": "BUG",
+  "difficulty": "easy",
+  "split": "dev",
+  "prompt": "缓存项在 now >= expiresAt 时过期；过期 get 返回 null 并删除该项。时钟由调用者传入，禁止使用系统时间。",
+  "files": {
+    "Cache.java": "import java.util.*;\npublic class Cache { record Entry(String value,long expiry){} private final Map<String,Entry> data=new HashMap<>(); public void put(String k,String v,long expiresAt){data.put(k,new Entry(v,expiresAt));} public String get(String k,long now){var e=data.get(k);return e==null?null:now>e.expiry()?null:e.value();} public int size(){return data.size();} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    var cache=new Cache();cache.put(\"k\",\"v\",100);assert cache.get(\"k\",99).equals(\"v\");assert cache.get(\"absent\",0)==null;\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Cache.java": "import java.util.*;\npublic class Cache { record Entry(String value,long expiry){} private final Map<String,Entry> data=new HashMap<>(); public void put(String k,String v,long expiresAt){data.put(k,new Entry(v,expiresAt));} public String get(String k,long now){var e=data.get(k);if(e==null)return null;if(now>=e.expiry()){data.remove(k);return null;}return e.value();} public int size(){return data.size();} }\n"
+  },
+  "editable": [
+    "Cache.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var cache=new Cache(); cache.put(\"k\",\"v\",100); assert cache.get(\"k\",100)==null; assert cache.size()==0;\n    cache.put(\"a\",\"b\",2); assert cache.get(\"a\",3)==null; assert cache.size()==0;\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    var cache=new Cache();cache.put(\"k\",\"v\",100);assert cache.get(\"k\",99).equals(\"v\");assert cache.get(\"absent\",0)==null;\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

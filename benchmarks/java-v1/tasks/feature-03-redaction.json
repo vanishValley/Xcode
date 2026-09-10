@@ -1,0 +1,24 @@
+{
+  "id": "feature-03-redaction",
+  "family": "redaction",
+  "category": "FEATURE",
+  "difficulty": "medium",
+  "split": "dev",
+  "prompt": "脱敏 Map 中名称等于 password、token、api_key 的键（忽略大小写），值替换为 ***；其他项保留；返回新 Map，不修改输入。",
+  "files": {
+    "Redactor.java": "import java.util.*;\npublic class Redactor { public static Map<String,String> redact(Map<String,String> input){return input;} }\n",
+    "VisibleCheck.java": "import java.util.*;\nimport java.math.*;\npublic class VisibleCheck {\n  public static void main(String[] args) throws Exception {\n    assert Redactor.redact(Map.of(\"name\",\"alice\")).equals(Map.of(\"name\",\"alice\"));\n    System.out.println(\"VisibleCheck: PASS\");\n  }\n}\n",
+    "README.md": "# Java maintenance fixture\nJava 17，无外部依赖。执行 javac *.java && java -ea VisibleCheck。\n"
+  },
+  "reference": {
+    "Redactor.java": "import java.util.*;\npublic class Redactor { public static Map<String,String> redact(Map<String,String> input){var out=new LinkedHashMap<String,String>();input.forEach((k,v)->out.put(k,Set.of(\"password\",\"token\",\"api_key\").contains(k.toLowerCase(Locale.ROOT))?\"***\":v));return out;} }\n"
+  },
+  "editable": [
+    "Redactor.java"
+  ],
+  "checks": {
+    "BehaviorCheck": "import java.util.*;\nimport java.math.*;\npublic class BehaviorCheck {\n  public static void main(String[] args) throws Exception {\n    var input=new LinkedHashMap<>(Map.of(\"TOKEN\",\"abc\",\"name\",\"alice\",\"api_key\",\"xyz\"));var out=Redactor.redact(input);assert out.get(\"TOKEN\").equals(\"***\");assert out.get(\"api_key\").equals(\"***\");assert out.get(\"name\").equals(\"alice\");assert input.get(\"TOKEN\").equals(\"abc\");\n    System.out.println(\"BehaviorCheck: PASS\");\n  }\n}\n",
+    "RegressionCheck": "import java.util.*;\nimport java.math.*;\npublic class RegressionCheck {\n  public static void main(String[] args) throws Exception {\n    assert Redactor.redact(Map.of(\"name\",\"alice\")).equals(Map.of(\"name\",\"alice\"));\n    System.out.println(\"RegressionCheck: PASS\");\n  }\n}\n"
+  },
+  "fault": "none"
+}

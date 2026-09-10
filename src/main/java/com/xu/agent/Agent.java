@@ -9,6 +9,7 @@ import com.xu.observability.MdcScope;
 import com.xu.observability.TraceScope;
 import com.xu.observability.Tracing;
 import com.xu.skill.SkillRegistry;
+import com.xu.skill.SkillTaskScope;
 import com.xu.tool.ToolExecutionResult;
 import com.xu.tool.ToolExecutor;
 import com.xu.tool.ToolRegistry;
@@ -30,10 +31,11 @@ import java.util.Set;
  * ReAct Agent —— "思考 (Think) → 行动 (Act) → 观察 (Observe)" 循环。
  *
  * 每轮 run() 的流程:
- *   1. 为本次任务冻结相关长期记忆和工具定义
+ *   1. 为本次任务冻结相关长期记忆
  *   2. 检查 Token 是否超限 → 触发对话压缩
- *   3. 按 [system + 目标 + 记忆 + Plan上下文 + 历史] 组装 messages
- *   4. 连同固定 tools 发送给 LLM
+ *   3. 按 [system + Skill索引 + 目标 + 记忆 + Plan上下文 + 历史]
+ *      组装 messages
+ *   4. 每轮重新获取可用工具定义，连同消息发送给 LLM
  *   5. LLM 返回 content → 保存会话，结束
  *   6. LLM 返回 tool_calls → 执行工具 → 结果回灌 → 回到第 2 步
  *
@@ -41,7 +43,6 @@ import java.util.Set;
  */
 public class Agent {
 
-    private static final int MAX_TURNS = 20;
     private static final Logger logger = LoggerFactory.getLogger(Agent.class);
 
     /** 最大启用 Skill 数量(索引段预算) */
@@ -76,7 +77,7 @@ public class Agent {
     private final UiEventSink events;
     private final CancellationToken cancellation;
 
-    /** Memory 系统门面（子 Agent 为 null） */
+    /** 每个实例独有的 Memory 门面，公共知识来源可以共享读取。 */
     private final MemoryManager memory;
 
     /** 持续累积的对话历史 */
@@ -153,14 +154,16 @@ public class Agent {
         if (!saved.isEmpty()) {
             history.addAll(saved);
             /*
-             * system prompt 和 Skill 索引属于运行时配置，每次启动都刷新。
-             * 否则恢复的旧会话可能看不到后来新增的 web-access Skill。
+             * 历史只保存完全稳定的基础 system prompt。Skill 索引
+             * 在每次组装 Prompt 时动态注入，使 reload/on/off 立即生效。
              */
             if (!history.isEmpty() && "system".equals(history.get(0).role)) {
-                history.get(0).content = buildSystemPrompt();
+                history.get(0).content = SYSTEM_PROMPT_BASE;
             } else {
-                history.add(0, new Message("system", buildSystemPrompt()));
+                history.add(0, new Message("system", SYSTEM_PROMPT_BASE));
             }
+            // 兼容旧版会话：不让已完成任务的 Skill 正文在恢复后继续常驻。
+            SkillTaskScope.releaseBodies(history);
             this.events.emit(new UiEvent.SessionChanged(
                     UiEvent.SessionAction.RESTORED,
                     saved.size(),
@@ -168,7 +171,7 @@ public class Agent {
             return;
         }
         // 空白启动
-        history.add(new Message("system", buildSystemPrompt()));
+        history.add(new Message("system", SYSTEM_PROMPT_BASE));
     }
 
     // 主Agent
@@ -238,7 +241,7 @@ public class Agent {
     /** 清空历史 + 删除会话文件 */
     public void clear() {
         history.clear();
-        history.add(new Message("system", buildSystemPrompt()));
+        history.add(new Message("system", SYSTEM_PROMPT_BASE));
         if (memory != null) {
             memory.deleteSession();
             memory.resetCompactor();
@@ -341,7 +344,21 @@ public class Agent {
      * 执行任务并返回文本与运行统计，供 Plan 子任务生成汇总日志。
      */
     RunResult runDetailed(String userInput) throws Exception {
+        return runCoordinated(userInput, AgentRunHooks.NONE);
+    }
+
+    /** 前台模式结束后回灌有来源的结果，不能把成员内容提升为 system 指令。 */
+    public void recordExternalResult(String request, String result) {
+        history.add(new Message("user", request));
+        history.add(new Message("assistant", result));
+        if (memory != null) persistSession();
+    }
+
+    /** Team 的窄执行入口；不创建普通会话的根 trace，也不并发访问同一实例。 */
+    public RunResult runCoordinated(String userInput, AgentRunHooks hooks) throws Exception {
         long startedAt = System.nanoTime();
+        // 新任务开始前清理旧版/异常中断遗留的 Skill 正文。
+        SkillTaskScope.releaseBodies(history);
         List<Message> historyBeforeRun = new ArrayList<>(history);
         int llmCalls = 0;
         int toolCalls = 0;
@@ -353,6 +370,8 @@ public class Agent {
         Message finalReply = null;
         Message pendingToolReply = null;
         boolean streamedFinal = false;
+        boolean paused = false;
+        SkillTaskScope taskSkills = new SkillTaskScope();
 
         events.emit(new UiEvent.AgentChanged(
                 taskLabel,
@@ -380,15 +399,13 @@ public class Agent {
                     memory.beginTask(userInput);
                 }
 
-                // 工具定义在同一次 ReAct 任务内固定，所有模型调用复用同一份。
-                List<Map<String, Object>> tools =
-                        toolRegistry.isEmpty()
-                                ? null
-                                : toolRegistry.toOpenAiTools();
-
                 // 2. ReAct 循环
-                for (int turn = 0; turn < MAX_TURNS; turn++) {
+                for (int turn = 0; turn < hooks.maxTurns(); turn++) {
                     cancellation.throwIfCancellationRequested();
+                    // 上一批工具已配对完成，才允许注入外部消息。
+                    history.addAll(hooks.receive());
+                    List<Map<String, Object>> tools = toolRegistry.isEmpty()
+                            ? null : toolRegistry.toOpenAiTools();
                     turns = turn + 1;
                     // 子 Span 自动继承当前 agent.invoke，形成调用树。
                     try (TraceScope turnScope = tracing.start("agent.turn")
@@ -429,9 +446,7 @@ public class Agent {
                                 }
                             }
 
-                            prompt = memory != null
-                                    ? memory.assemblePrompt(history)
-                                    : new ArrayList<>(history);
+                            prompt = assemblePrompt();
                             usage = memory != null
                                     ? (int) (memory.contextUsagePercent(prompt)
                                             * 100)
@@ -465,6 +480,9 @@ public class Agent {
                                 usage,
                                 "准备模型请求"));
 
+                        if (!hooks.instructions().isBlank()) {
+                            prompt.add(1, new Message("system", hooks.instructions()));
+                        }
                         // 2c. 发请求
                         events.emit(new UiEvent.AgentChanged(
                                 taskLabel,
@@ -473,7 +491,7 @@ public class Agent {
                                 usage,
                                 "等待模型"));
                         boolean streamThisCall =
-                                "main".equals(taskLabel)
+                                hooks == AgentRunHooks.NONE && "main".equals(taskLabel)
                                         && events.supportsStreaming();
                         StreamingDisplaySanitizer streamDisplay =
                                 streamThisCall
@@ -485,6 +503,7 @@ public class Agent {
                                         : null;
                         Message reply;
                         try {
+                            hooks.beforeRequest();
                             reply = streamThisCall
                                     ? llmClient.chatRawStreaming(
                                             prompt,
@@ -506,6 +525,11 @@ public class Agent {
                                 || reply.toolCalls.isEmpty()) {
                             // 纯文本回答 → 结束
                             history.add(reply);
+                            String blocker = hooks.finishBlocker();
+                            if (!blocker.isBlank()) {
+                                history.add(new Message("user", "【运行时完成检查】" + blocker));
+                                continue;
+                            }
                             turnScope.attribute(
                                             "agent.turn.next_action",
                                             "FINAL_ANSWER")
@@ -529,8 +553,16 @@ public class Agent {
 
                         for (ToolCall tc : reply.toolCalls) {
                             cancellation.throwIfCancellationRequested();
-                            ToolExecutionResult execution =
-                                    toolExecutor.execute(tc);
+                            if (hooks.pauseRequested()) {
+                                Message skipped = new Message("tool", "因等待主 Agent 回答，本调用未执行。");
+                                skipped.toolCallId = tc.id;
+                                history.add(skipped);
+                                continue;
+                            }
+                            hooks.beforeTool(tc);
+                            ToolExecutionResult execution = taskSkills.record(
+                                    tc,
+                                    toolExecutor.execute(tc));
                             toolCalls++;
                             if (mayHaveMutated(tc, execution)) {
                                 mutatingToolUsed = true;
@@ -545,6 +577,11 @@ public class Agent {
                             history.add(toolMsg);
                         }
                         pendingToolReply = null;
+                        if (hooks.pauseRequested()) {
+                            paused = true;
+                            finalReply = new Message("assistant", hooks.pauseReason());
+                            history.add(finalReply);
+                        }
                     }
 
                     if (finalReply != null) {
@@ -553,11 +590,12 @@ public class Agent {
                 }
 
                 if (finalReply != null) {
+                    releaseTaskSkills(taskSkills);
                     if (memory != null) {
                         persistSession();
                         extractLongTermMemory();
                     }
-                    runScope.attribute("agent.outcome", "SUCCESS")
+                    runScope.attribute("agent.outcome", paused ? "NEEDS_INPUT" : "SUCCESS")
                             .attribute("agent.turn.count", turns)
                             .attribute("agent.llm.call_count", llmCalls)
                             .attribute("agent.tool.call_count", toolCalls)
@@ -569,7 +607,7 @@ public class Agent {
                     logger.atDebug()
                             .addKeyValue("event", "agent.invoke.completed")
                             .addKeyValue("task_label", taskLabel)
-                            .addKeyValue("outcome", "SUCCESS")
+                            .addKeyValue("outcome", paused ? "NEEDS_INPUT" : "SUCCESS")
                             .addKeyValue("turn_count", turns)
                             .addKeyValue("llm_calls", llmCalls)
                             .addKeyValue("tool_calls", toolCalls)
@@ -582,7 +620,7 @@ public class Agent {
                             .log("Agent 任务执行完成");
                     RunResult result = new RunResult(
                             finalReply.content,
-                            "SUCCESS",
+                            paused ? "NEEDS_INPUT" : "SUCCESS",
                             turns,
                             llmCalls,
                             toolCalls,
@@ -599,7 +637,7 @@ public class Agent {
 
                 // 兜底: 超过最大轮数
                 runScope.attribute("agent.outcome", "DEGRADED")
-                        .attribute("agent.turn.count", MAX_TURNS)
+                        .attribute("agent.turn.count", hooks.maxTurns())
                         .attribute("agent.llm.call_count", llmCalls)
                         .attribute("agent.tool.call_count", toolCalls)
                         .attribute(
@@ -610,7 +648,7 @@ public class Agent {
                         .addKeyValue("event", "agent.invoke.max_turns")
                         .addKeyValue("task_label", taskLabel)
                         .addKeyValue("outcome", "DEGRADED")
-                        .addKeyValue("max_turns", MAX_TURNS)
+                        .addKeyValue("max_turns", hooks.maxTurns())
                         .addKeyValue("llm_calls", llmCalls)
                         .addKeyValue("tool_calls", toolCalls)
                         .addKeyValue("recovered_errors", recoveredErrors)
@@ -619,15 +657,16 @@ public class Agent {
                         .addKeyValue(
                                 "duration_ms", runScope.elapsedMillis())
                         .log("达到最大轮数仍未完成");
+                releaseTaskSkills(taskSkills);
                 if (memory != null) {
                     persistSession();
                     extractLongTermMemory();
                 }
                 RunResult degraded = new RunResult(
-                        "已执行 " + MAX_TURNS
+                        "已执行 " + hooks.maxTurns()
                                 + " 轮工具调用仍未完成任务，请简化需求或补充说明。",
                         "DEGRADED",
-                        MAX_TURNS,
+                        hooks.maxTurns(),
                         llmCalls,
                         toolCalls,
                         recoveredErrors,
@@ -642,9 +681,10 @@ public class Agent {
                  * 并为未完成调用补充“状态未知”；只有从未启动工具的任务才能整体回滚。
                  */
                 boolean partialToolEffects =
-                        toolCalls > 0 || pendingToolReply != null;
+                        toolCalls > 0 || pendingToolReply != null || hooks.preserveHistoryOnFailure();
                 if (partialToolEffects) {
                     completeInterruptedToolBatch(pendingToolReply);
+                    releaseTaskSkills(taskSkills);
                     history.add(new Message(
                             "system",
                             "【本地恢复标记】上一轮在工具执行后中断。"
@@ -762,6 +802,18 @@ public class Agent {
         }
     }
 
+    /** 任务结束后释放完整 Skill 正文，但保留 tool_call/tool 协议证据。 */
+    private void releaseTaskSkills(SkillTaskScope taskSkills) {
+        int released = SkillTaskScope.releaseBodies(history);
+        if (released > 0) {
+            logger.atDebug()
+                    .addKeyValue("event", "skill.task.released")
+                    .addKeyValue("skill_count", taskSkills.loadedNames().size())
+                    .addKeyValue("tool_result_count", released)
+                    .log("已释放任务级 Skill 正文");
+        }
+    }
+
     private void emitCompleted(
             RunResult result,
             long startedAt,
@@ -813,18 +865,29 @@ public class Agent {
     // ── Skill 支持 ──
 
     /**
-     * 动态拼接 system prompt = 基础规则 + Skill 索引。
-     *
-     * 这里只放 name + description，相当于“能力目录”；完整正文由 load_skill
-     * 在任务命中时读取，属于渐进式披露，避免每轮都携带所有 Skill 内容。
+     * 按稳定性组装 Prompt：基础 system → Skill 索引 → 任务上下文
+     * → 动态历史。Skill 索引不进入干净历史，因此 reload/on/off 后
+     * 下一次模型请求即可看到新索引。
      */
-    private String buildSystemPrompt() {
-        if (skillRegistry == null) return SYSTEM_PROMPT_BASE;
+    private List<Message> assemblePrompt() {
+        String skillIndex = buildSkillIndex();
+        if (memory != null) {
+            return memory.assemblePrompt(history, skillIndex);
+        }
 
-        String index = buildSkillIndex();
-        if (index.isEmpty()) return SYSTEM_PROMPT_BASE;
-
-        return SYSTEM_PROMPT_BASE + "\n\n" + index;
+        List<Message> prompt = new ArrayList<>();
+        int historyStart = 0;
+        if (!history.isEmpty() && "system".equals(history.get(0).role)) {
+            prompt.add(history.get(0));
+            historyStart = 1;
+        }
+        if (!skillIndex.isBlank()) {
+            prompt.add(new Message("system", skillIndex));
+        }
+        for (int i = historyStart; i < history.size(); i++) {
+            prompt.add(history.get(i));
+        }
+        return prompt;
     }
 
     /**
@@ -837,6 +900,7 @@ public class Agent {
      *   判断准则: 当任务匹配上方 Skill 描述时, 先调 load_skill(name) 加载完整指引再干活。
      */
     private String buildSkillIndex() {
+        if (skillRegistry == null) return "";
         Set<String> disabled = com.xu.skill.SkillStateStore.DISABLED_HOLDER;
         var enabled = skillRegistry.enabledSkills(disabled);
         if (enabled.isEmpty()) return "";

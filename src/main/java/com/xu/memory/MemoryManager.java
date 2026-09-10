@@ -36,15 +36,35 @@ public class MemoryManager {
     private String taskContext;
     /** 一次 ReAct 任务开始时检索，任务内所有工具轮次复用同一份。 */
     private List<MemoryRecord> frozenMemories = List.of();
+    private boolean allowExtraction = true;
+
+    /** Team 使用独立压缩器，不读写普通会话，也不自动写公共长期记忆。 */
+    public static MemoryManager forTeam(LongTermMemory sharedMemory, LlmClient client, String projectPath) {
+        TokenBudget fullBudget = new TokenBudget() {
+            private final com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            @Override public long estimateTokens(List<Message> messages) {
+                try { return (mapper.writeValueAsBytes(messages).length + 1L) / 2; }
+                catch (IOException e) { throw new IllegalStateException("Cannot estimate Team context", e); }
+            }
+        };
+        MemoryManager memory = new MemoryManager(null, sharedMemory, client, projectPath, fullBudget);
+        memory.allowExtraction = false;
+        return memory;
+    }
 
     /** 主 Agent 用的完整构造 */
     public MemoryManager(SessionStore sessionStore,
                          LongTermMemory longTermMemory,
                          LlmClient llmClient,
                          String projectPath) {
+        this(sessionStore, longTermMemory, llmClient, projectPath, new TokenBudget());
+    }
+
+    private MemoryManager(SessionStore sessionStore, LongTermMemory longTermMemory,
+                          LlmClient llmClient, String projectPath, TokenBudget tokenBudget) {
         this.sessionStore = sessionStore;
         this.longTermMemory = longTermMemory;
-        this.tokenBudget = new TokenBudget();
+        this.tokenBudget = tokenBudget;
         this.compactor = new ConversationCompactor(llmClient, tokenBudget);
         this.projectPath = projectPath;
     }
@@ -116,14 +136,20 @@ public class MemoryManager {
     /**
      * 从原始历史和临时上下文组装本轮 Prompt，并返回新的列表。
      *
-     * <p>固定顺序：基础 system + Skill 索引 → 目标锚点 → 冻结长期记忆
-     * → Plan 上下文 → 原始 user/assistant/tool 历史。
+     * <p>固定顺序：基础 system → Skill 索引 → 目标锚点 → 冻结长期记忆
+     * → Plan 上下文 → 原始 user/assistant/tool 历史。越稳定的内容越靠前，
+     * 便于服务商复用相同的 Token 前缀。
+     *
+     * @param cleanHistory 不含临时注入块的原始会话历史
+     * @param skillIndex 当前 Skill 能力索引；仅在组装时注入，不持久化
      */
-    public List<Message> assemblePrompt(List<Message> cleanHistory) {
+    public List<Message> assemblePrompt(
+            List<Message> cleanHistory,
+            String skillIndex) {
         totalTurns++;
         List<Message> prompt = new ArrayList<>();
 
-        // 1. 基础 system prompt + Skill 索引。
+        // 1. 完全稳定的基础 system prompt。
         int historyStart = 0;
         if (!cleanHistory.isEmpty()
                 && "system".equals(cleanHistory.get(0).role)) {
@@ -131,12 +157,17 @@ public class MemoryManager {
             historyStart = 1;
         }
 
-        // 2. 目标锚点。
+        // 2. 半稳定的 Skill 索引：只在 reload/on/off 后变化。
+        if (skillIndex != null && !skillIndex.isBlank()) {
+            prompt.add(new Message("system", skillIndex));
+        }
+
+        // 3. 目标锚点。
         if (taskGoal != null && !taskGoal.isEmpty()) {
             prompt.add(new Message("system", "【当前目标】" + taskGoal));
         }
 
-        // 3. 本次任务冻结的长期记忆。
+        // 4. 本次任务冻结的长期记忆。
         if (!frozenMemories.isEmpty()) {
             StringBuilder block = new StringBuilder("## 相关记忆\n");
             int chars = 0;
@@ -151,17 +182,22 @@ public class MemoryManager {
             prompt.add(new Message("system", block.toString()));
         }
 
-        // 4. Plan 上下文。
+        // 5. Plan 上下文。
         if (taskContext != null && !taskContext.isEmpty()) {
             prompt.add(new Message("system", taskContext));
         }
 
-        // 5. 原始 user/assistant/tool 历史；滚动摘要也留在原历史中的原位置。
+        // 6. 原始 user/assistant/tool 历史；滚动摘要也留在原历史中的原位置。
         for (int i = historyStart; i < cleanHistory.size(); i++) {
             prompt.add(cleanHistory.get(i));
         }
 
         return prompt;
+    }
+
+    /** 兼容无 Skill 索引的调用方。 */
+    public List<Message> assemblePrompt(List<Message> cleanHistory) {
+        return assemblePrompt(cleanHistory, null);
     }
 
     /**
@@ -225,6 +261,7 @@ public class MemoryManager {
 
     /** 尽力从“失败→修正→成功”的执行记录中提炼经验；失败不影响主流程。 */
     public void tryAutoExtract(List<Message> history, LlmClient llmClient) {
+        if (!allowExtraction) return;
         if (longTermMemory == null || projectPath == null) return;
         LessonExtractor.tryExtract(
                 history,
