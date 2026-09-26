@@ -32,6 +32,7 @@ public final class TeamRuntime implements AutoCloseable {
     private final Map<String, Delivery> deliveries = new HashMap<>();
     private final Map<String, Result> results = new LinkedHashMap<>();
     private final Map<String, Question> questions = new LinkedHashMap<>();
+    private final Map<String, Contract> contracts = new LinkedHashMap<>();
     private final List<Event> events = new ArrayList<>();
     private long sequence, visibleSequence, criticalSequence, workspaceEpoch;
     private int attempts;
@@ -51,6 +52,7 @@ public final class TeamRuntime implements AutoCloseable {
         String questionId = "";
         String lastResultId = "";
         long epoch;
+        boolean controlled;
         Handle(String id, Task task, CancellationToken token) {
             this.id = id; this.task = task; this.token = token;
         }
@@ -76,7 +78,7 @@ public final class TeamRuntime implements AutoCloseable {
             checkActive();
             String oldId = creations.get(operationKey);
             if (oldId != null) return receipt(members.get(oldId));
-            requireResearch();
+            if (task.profile() == Profile.READ_ONLY) requireResearch();
             long live = members.values().stream().filter(h -> !Set.of(State.FAILED, State.CANCELLED, State.CLOSED).contains(h.state)).count();
             if (++attempts > config.maxCreations() || live >= config.maxMembers())
                 throw error("TEAM_CAPACITY_EXCEEDED", "团队成员或创建次数已达上限，请复用空闲成员");
@@ -103,7 +105,7 @@ public final class TeamRuntime implements AutoCloseable {
         } catch (Exception e) {
             synchronized (lock) {
                 handle.state = closing || handle.token.isCancelled() ? State.CANCELLED : State.FAILED;
-                publish("FAILURE", handle, "", "成员创建失败: " + e.getClass().getSimpleName(), "");
+                publish("FAILURE", handle, "", "成员创建失败: " + failureDescription(e), "");
             }
         }
         synchronized (lock) { return receipt(handle); }
@@ -189,7 +191,10 @@ public final class TeamRuntime implements AutoCloseable {
             handle = member(target);
             if (Set.of(State.CLOSED, State.CANCELLED, State.CANCELLING, State.FAILED, State.CREATING).contains(handle.state))
                 throw error("AGENT_UNAVAILABLE", "成员当前不能接收指令: " + handle.state);
-            if (action != Action.NOTIFY) requireResearch();
+            if (action != Action.NOTIFY) {
+                if (handle.controlled) throw error("WORKSPACE_BUSY", "成员成果正在交付或集成，不能同时续接");
+                if (handle.task.profile() == Profile.READ_ONLY) requireResearch();
+            }
             // 通知与续接分开限流；通知满时仍须允许 CONTINUE 唤醒消费者。
             // ANSWER 保留一个控制槽，不能被排队任务挡住导致永远无法解除等待。
             if ((action == Action.NOTIFY && handle.notifications.size() >= config.mailboxCapacity())
@@ -275,6 +280,65 @@ public final class TeamRuntime implements AutoCloseable {
     }
     public List<Result> results() { synchronized (lock) { return List.copyOf(results.values()); } }
 
+    /** 集成/读取交付期间冻结指定空闲成员，不能仅先检查状态再执行 Git。 */
+    public AutoCloseable leaseMembers(List<String> ids) {
+        synchronized (lock) {
+            checkActive();
+            List<Handle> handles = ids.stream().distinct().map(this::member).toList();
+            for (Handle handle : handles)
+                if (active(handle) || handle.controlled)
+                    throw error("WORKSPACE_BUSY", "成员尚未实际退出或已被集成占用: " + handle.id);
+            handles.forEach(h -> h.controlled = true);
+            return () -> { synchronized (lock) { handles.forEach(h -> h.controlled = false); lock.notifyAll(); } };
+        }
+    }
+
+    public Delivery sendContract(String operationKey, String target, String content) {
+        synchronized (lock) {
+            Delivery delivery = send(operationKey, target, Action.NOTIFY,
+                    "【公共契约变更，需要 acknowledge_contract 确认；确认不代表代码已同步】\n" + content, "");
+            contracts.putIfAbsent(delivery.messageId(), new Contract(delivery.messageId(), target, content, "QUEUED", ""));
+            return delivery;
+        }
+    }
+
+    public Contract acknowledge(String agentId, String messageId, boolean accepted, String response) {
+        text(response, "response", 4096);
+        synchronized (lock) {
+            checkActive();
+            Contract contract = contracts.get(messageId);
+            if (contract == null || !contract.targetId().equals(agentId))
+                throw error("INVALID_MESSAGE", "不能确认不存在或其他成员的契约消息");
+            if (contract.status().equals("QUEUED")) throw error("MESSAGE_NOT_PRESENTED", "消息尚未呈现给该成员");
+            if (!contract.status().equals("PRESENTED")) return contract;
+            Contract updated = new Contract(messageId, agentId, contract.content(), accepted ? "ACCEPTED" : "REJECTED", response);
+            contracts.put(messageId, updated);
+            publish("CONTRACT_ACKNOWLEDGED", member(agentId), messageId, TeamJson.write(updated), "");
+            return updated;
+        }
+    }
+
+    public void resolveContract(String messageId, String reason) {
+        text(reason, "reason", 4096);
+        synchronized (lock) {
+            checkActive();
+            Contract contract = contracts.get(messageId);
+            if (contract == null) throw error("INVALID_MESSAGE", "契约消息不存在");
+            contracts.put(messageId, new Contract(messageId, contract.targetId(), contract.content(), "WITHDRAWN", reason));
+            publish("CONTRACT_WITHDRAWN", member(contract.targetId()), messageId, reason, "");
+        }
+    }
+
+    public List<Contract> contracts() { synchronized (lock) { return List.copyOf(contracts.values()); } }
+
+    public String contractBlocker(String agentId) {
+        synchronized (lock) {
+            return contracts.values().stream().anyMatch(c -> (agentId == null || c.targetId().equals(agentId))
+                    && !Set.of("ACCEPTED", "WITHDRAWN").contains(c.status()))
+                    ? "存在未确认或被拒绝的公共契约：成员确认，或主 Agent 撤回并记录原因" : "";
+        }
+    }
+
     /** 工具返回和边界注入共用消费位置，不能相信模型自行提供的游标表示已消费。 */
     public Batch await(long after, int max, Duration timeout) throws InterruptedException {
         if (max < 1 || max > 32 || timeout.isNegative() || timeout.compareTo(Duration.ofSeconds(30)) > 0)
@@ -300,7 +364,10 @@ public final class TeamRuntime implements AutoCloseable {
     public AgentRunHooks hooks(String agentId, boolean lead) {
         return new AgentRunHooks() {
             @Override public int maxTurns() { return lead ? 40 : 20; }
-            @Override public String instructions() { return lead ? TeamPrompts.LEAD : TeamPrompts.WORKER; }
+            @Override public String instructions() {
+                if (lead) return TeamPrompts.LEAD;
+                synchronized (lock) { return member(agentId).task.profile() == Profile.ISOLATED_WRITE ? TeamPrompts.WRITER : TeamPrompts.WORKER; }
+            }
             @Override public boolean preserveHistoryOnFailure() { return true; }
             @Override public List<LlmClient.Message> receive() {
                 synchronized (lock) {
@@ -314,6 +381,9 @@ public final class TeamRuntime implements AutoCloseable {
                     List<LlmClient.Message> messages = new ArrayList<>();
                     while (!handle.notifications.isEmpty() && messages.size() < 8) {
                         Envelope message = handle.notifications.removeFirst();
+                        Contract contract = contracts.get(message.messageId());
+                        if (contract != null && contract.status().equals("QUEUED"))
+                            contracts.put(message.messageId(), new Contract(contract.messageId(), contract.targetId(), contract.content(), "PRESENTED", ""));
                         messages.add(new LlmClient.Message("user", "【来自主 Agent / " + message.messageId() + "】\n" + message.content()));
                         publish("MESSAGE_IN_HISTORY", handle, message.messageId(), "已加入成员历史，尚不保证模型处理", "");
                     }
@@ -355,6 +425,8 @@ public final class TeamRuntime implements AutoCloseable {
             checkActive();
             if (members.values().stream().anyMatch(this::active)) return "成员仍在执行；使用 wait_agents 或 stop_agent，并等待实际退出。";
             if (questions.values().stream().anyMatch(q -> !q.resolved())) return "存在未解决问题，请回答或用 resolve_question 说明原因。";
+            String contractBlocker = contractBlocker(null);
+            if (!contractBlocker.isEmpty()) return contractBlocker;
             if (criticalSequence > visibleSequence) return "有尚未读取的成员结果或问题，请先接收更新。";
             List<String> unread = members.values().stream().filter(h -> !h.notifications.isEmpty()).map(h -> h.id).toList();
             if (!unread.isEmpty()) return "这些成员有未消费通知，请继续或停止成员: " + unread;
@@ -380,7 +452,7 @@ public final class TeamRuntime implements AutoCloseable {
     public AutoCloseable exclusive() {
         synchronized (lock) {
             checkActive();
-            if (exclusive || members.values().stream().anyMatch(this::active))
+            if (exclusive || members.values().stream().anyMatch(h -> h.task.profile() == Profile.READ_ONLY && active(h)))
                 throw error("WORKSPACE_BUSY", "先等待所有成员本轮执行停止，再修改工作区或执行命令");
             exclusive = true;
         }
@@ -452,7 +524,7 @@ public final class TeamRuntime implements AutoCloseable {
                     if (h.thread != null) h.thread.interrupt();
                 }
             }
-            if (Set.of("QUESTION", "RESULT", "FAILURE").contains(type)) criticalSequence = sequence;
+            if (Set.of("QUESTION", "RESULT", "FAILURE", "CONTRACT_ACKNOWLEDGED").contains(type)) criticalSequence = sequence;
         }
         lock.notifyAll();
         // UI 观察者必须是非阻塞事件 sink；异常不能破坏成员状态机。

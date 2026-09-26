@@ -27,6 +27,25 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class ExecuteCommandTool implements Tool {
 
+    private final java.nio.file.Path projectRoot;
+    private final Map<String, String> environment;
+    private final int timeoutSeconds;
+
+    public ExecuteCommandTool() {
+        this(java.nio.file.Path.of("."), Map.of());
+    }
+
+    public ExecuteCommandTool(java.nio.file.Path projectRoot, Map<String, String> environment) {
+        this(projectRoot, environment, TIMEOUT_SECONDS);
+    }
+
+    public ExecuteCommandTool(java.nio.file.Path projectRoot, Map<String, String> environment, int timeoutSeconds) {
+        if (timeoutSeconds < 1 || timeoutSeconds > 3600) throw new IllegalArgumentException("timeoutSeconds must be 1..3600");
+        this.projectRoot = projectRoot.toAbsolutePath().normalize();
+        this.environment = Map.copyOf(environment);
+        this.timeoutSeconds = timeoutSeconds;
+    }
+
     /** 命令执行超时（秒），超过即强杀进程 */
     private static final int TIMEOUT_SECONDS = 60;
     /** 输出最大字符数，超过则截断并标记 */
@@ -58,7 +77,7 @@ public class ExecuteCommandTool implements Tool {
     @Override
     public String description() {
         return "在当前项目目录执行 Shell 命令。参数：command（要执行的命令字符串）。" +
-                "超时 60 秒，输出上限 8000 字符。mvn、javac、git 等常用命令可正常使用。";
+                "超时 " + timeoutSeconds + " 秒，输出上限 8000 字符。mvn、javac、git 等常用命令可正常使用。";
     }
 
     @Override
@@ -116,7 +135,10 @@ public class ExecuteCommandTool implements Tool {
         } else {
             pb.command("sh", "-c", command);
         }
-        pb.directory(new java.io.File("."));  // 工作目录 = 项目根
+        pb.directory(projectRoot.toFile());  // 每任务显式绑定目录，不修改 JVM 的全局 user.dir。
+        pb.environment().putAll(environment);
+        for (String key : List.of("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"))
+            pb.environment().remove(key);
         pb.redirectErrorStream(true);          // stderr 合并到 stdout
 
         Process process = pb.start();
@@ -148,7 +170,7 @@ public class ExecuteCommandTool implements Tool {
         try {
             // 等待进程结束，超时则强杀
             timedOut = !process.waitFor(
-                    TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                    timeoutSeconds, TimeUnit.SECONDS);
             if (timedOut) {
                 destroyProcessTree(process);
                 process.waitFor(5, TimeUnit.SECONDS);
@@ -181,7 +203,7 @@ public class ExecuteCommandTool implements Tool {
         StringBuilder result = new StringBuilder();
         result.append("命令: ").append(command).append("\n");
         result.append("退出码: ").append(exitCode);
-        if (timedOut) result.append("（超时，" + TIMEOUT_SECONDS + "秒）");
+        if (timedOut) result.append("（超时，" + timeoutSeconds + "秒）");
         result.append("\n\n");
         if (outputText.isEmpty()) {
             result.append("(无输出)");

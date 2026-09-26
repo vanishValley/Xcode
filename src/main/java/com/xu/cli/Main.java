@@ -184,7 +184,7 @@ public final class Main {
         registry.register(new ReadFileTool());
         registry.register(new WriteFileTool(paths.projectRoot()));
         registry.register(new ListDirTool());
-        registry.register(new ExecuteCommandTool());
+        registry.register(new ExecuteCommandTool(paths.projectRoot(), Map.of()));
         registry.register(new GlobFilesTool(paths.projectRoot()));
 
         paths.initProjectIfNeeded();

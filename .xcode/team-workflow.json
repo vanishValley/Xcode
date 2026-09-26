@@ -1,0 +1,4 @@
+{
+  "verificationCommands": ["mvn -B verify"],
+  "verificationTimeoutSeconds": 600
+}

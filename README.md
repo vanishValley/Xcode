@@ -12,7 +12,7 @@
 | --- | --- |
 | ReAct 执行 | 多轮模型与工具交互、SSE 流式输出、Tool Call 增量重组、异常结果回灌 |
 | Plan-and-Execute | DAG 规划、依赖与环检测、并行 Worker、Reviewer、checkpoint 与失败重规划 |
-| Team 协作 | 动态创建成员、独立上下文、消息与续接、并行调查、主 Agent 集中修改 |
+| Team 协作 | 独立上下文、契约消息确认、只读调查或 worktree 并行开发、固定提交交付与组合验收 |
 | 工具系统 | 文件读写、目录搜索、Shell、网页搜索与抓取、统一参数解析和错误结果 |
 | 记忆管理 | 会话持久化、上下文压缩、目标锚定、项目/全局长期记忆、经验提炼 |
 | Skills | 内置/全局/项目三级发现、按需加载、任务内去重、任务结束释放正文 |
@@ -64,9 +64,9 @@ CommandProcessor
 
 **Plan-and-Execute** 先生成有依赖关系的任务图，再选择就绪任务并行执行。Worker 提交前保存 `IN_PROGRESS` checkpoint，步骤结束后更新状态。普通失败可以重规划；超时、取消或副作用状态未知时停止自动重放，保留现场供检查。
 
-**Team** 由主 Agent 根据调查进展动态分工。成员使用独立历史和只读工具，通过消息汇报结果、提出问题或接受后续任务。运行时限制并发、创建数量、调用预算和总时间；所有成员停止活动后，主 Agent 才能独占工作区执行修改和命令。同一成员的续接串行执行，完成前检查活跃成员、未解决问题和未读结果。
+**Team** 由主 Agent 动态分工。`READ_ONLY` 成员并行调查，主 Agent 在共享读成员停止后集中修改；`ISOLATED_WRITE` 成员使用独立 worktree、分支和工具环境开发。依赖必须已有固定交付，运行时准备包含依赖提交的基线。同一成员的续接串行执行，公共契约消息需要明确确认。写任务交付后在独立候选分支组合，通过项目检查策略和 Agent 审查后交付；不会自动修改用户分支或推送远端。运行时限制并发、创建数量、预算和总时间，并阻止提前结束或使用过期验证。
 
-详见 [Team 协作设计](docs/team-mode-implementation.md)。
+详见 [Team 协作使用](docs/team-mode-implementation.md) 和 [多任务执行与集成设计](docs/multi-task-workspace-design.md)。
 
 ### 工具与扩展
 
@@ -94,7 +94,7 @@ MCP 首次使用时才连接和发现工具。stdio 与 Streamable HTTP 共享�
 
 每次任务使用独立的取消 generation，取消向模型请求、Worker、待审批操作、工具和 Shell 子进程传播。已经执行的写入与状态未知操作不会因重试而被静默重放。写文件工具检查项目路径边界，网页抓取校验目标与重定向地址，显示层处理凭据和终端控制字符。
 
-工具在宿主系统权限下运行；当前没有容器或独立系统账户沙箱。Team 成员的只读限制由工具视图强制执行，通用 Shell 不提供给成员。
+工具在宿主系统权限下运行；当前没有容器或独立系统账户沙箱。只读成员不能使用 Shell；独立写成员的 Shell 绑定任务目录并保留审批，未知 MCP 不继承。worktree 不隔离操作系统权限、端口或外部数据库，项目命令需使用任务资源命名空间配置这些资源。
 
 ## 快速开始
 
@@ -135,7 +135,7 @@ java -jar /path/to/Xcode/target/Xcode-1.0-SNAPSHOT.jar --ui=plain
 | --- | --- |
 | `/help`、`/status`、`/tools` | 帮助、运行配置与工具列表 |
 | `/plan <任务>` | 规划、并行执行和审查 |
-| `/team <任务>` | 动态成员协作与集中修改 |
+| `/team <任务>` | 并行调查或隔离开发、契约协调与组合验收 |
 | `/hitl on/off` | 切换危险工具审批 |
 | `/skills`、`/skill reload` | 查看与重新加载 Skills |
 | `/skill on/off <name>` | 启停指定 Skill |
@@ -146,7 +146,7 @@ java -jar /path/to/Xcode/target/Xcode-1.0-SNAPSHOT.jar --ui=plain
 
 ## 测试与评测
 
-当前包含 **58 个测试类、208 项 JUnit 测试**，覆盖执行协议、规划恢复、Team 并发与权限、记忆和 Skills、MCP、取消、UI 以及观测采集。
+JUnit 测试覆盖执行协议、规划恢复、Team 并发与权限、真实 Git worktree 与集成门禁、记忆和 Skills、MCP、取消、UI 以及观测采集。以本次 Surefire 报告为实际测试数量依据。
 
 ```bash
 mvn test
@@ -172,6 +172,7 @@ java -cp target/Xcode-1.0-SNAPSHOT.jar com.xu.eval.EvalMain run --adapter live -
 ## 文档
 
 - [Team 协作设计与使用](docs/team-mode-implementation.md)
+- [多任务工作区、交付与集成设计](docs/multi-task-workspace-design.md)
 - [记忆与上下文管理](docs/memory_design.md)
 - [TUI 交互层设计](docs/tui-design.md)
 - [可观测性与评测统一设计](docs/observability-evaluation-design.md)
@@ -184,4 +185,4 @@ java -cp target/Xcode-1.0-SNAPSHOT.jar com.xu.eval.EvalMain run --adapter live -
 - 扩展真实仓库任务和长期记忆评测，积累真实模型对照结果。
 - 增加 Patch / Diff 编辑、变更预览与细粒度审批。
 - 支持可配置工具权限、多个模型 Provider 和 MCP 声明式配置。
-- 完善工作区隔离与资源配额。
+- 扩展操作系统沙箱、外部服务资源分配和远端合并队列接入。

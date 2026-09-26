@@ -30,8 +30,8 @@ public final class TeamEventStore implements AutoCloseable {
                 SafeDisplay.redact(TeamJson.write(result)), StandardCharsets.UTF_8));
     }
     public void manifest(Object manifest) {
-        enqueue(() -> Files.writeString(directory.resolve("manifest.json"),
-                SafeDisplay.redact(TeamJson.write(manifest)), StandardCharsets.UTF_8));
+        enqueue(() -> com.xu.util.FileUtils.atomicWrite(directory.resolve("manifest.json"),
+                SafeDisplay.redact(TeamJson.write(manifest))));
     }
     public Path directory() { return directory; }
     public String failure() { return failure == null ? "" : failure.getClass().getSimpleName(); }
