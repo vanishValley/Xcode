@@ -79,18 +79,12 @@ public class WriteFileTool implements Tool {
 
         // toRealPath 会解析符号链接，防止通过 /tmp/link -> /etc 这类方式逃逸
         Path realRoot = projectRoot.toRealPath();
-        Path realFile = filePath;
-        try {
-            // 父目录不存在时无法 toRealPath，先尝试创建
-            if (Files.exists(filePath)) {
-                realFile = filePath.toRealPath();
-            } else if (filePath.getParent() != null && Files.exists(filePath.getParent())) {
-                realFile = filePath.getParent().toRealPath().resolve(filePath.getFileName());
-            }
-            // 如果父目录都不存在，跳过 realPath 检查，后续写入时会自动创建
-        } catch (java.io.IOException ignored) {
-            // 解析失败就信任 normalize 后的路径
-        }
+        // 找最近的现存祖先；深层新目录也不能借符号链接逃逸。
+        Path ancestor = filePath;
+        while (ancestor != null && !Files.exists(ancestor, java.nio.file.LinkOption.NOFOLLOW_LINKS))
+            ancestor = ancestor.getParent();
+        if (ancestor == null) return "错误：无法解析目标路径";
+        Path realFile = ancestor.toRealPath().resolve(ancestor.relativize(filePath)).normalize();
 
         if (!realFile.startsWith(realRoot)) {
             return String.format(

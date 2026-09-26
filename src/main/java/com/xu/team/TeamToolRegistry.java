@@ -20,27 +20,53 @@ final class TeamToolRegistry extends ToolRegistry {
     private final String agentId;
     private final Path root;
     private final CancellationToken token;
+    private final TeamWorkspaceService workflow;
+    private final boolean writer;
     private final ThreadLocal<String> requestId = new ThreadLocal<>();
     private final ThreadLocal<String> callId = new ThreadLocal<>();
 
     TeamToolRegistry(ToolRegistry base, TeamRuntime runtime, String agentId,
                      boolean lead, Path root, CancellationToken token) throws java.io.IOException {
+        this(base, runtime, agentId, lead, root, token, null, false);
+    }
+
+    TeamToolRegistry(ToolRegistry base, TeamRuntime runtime, String agentId,
+                     boolean lead, Path root, CancellationToken token,
+                     TeamWorkspaceService workflow, boolean writer) throws java.io.IOException {
         this.base = base; this.runtime = runtime; this.agentId = agentId; this.lead = lead;
         this.root = root.toRealPath(); this.token = token;
+        this.workflow = workflow; this.writer = writer;
         installTools();
     }
 
     private void installTools() {
         if (lead) {
-            add("spawn_agent", "异步创建只读调查成员，返回 ID；不能给成员修改或 Shell 任务。",
+            add("spawn_agent", "创建 READ_ONLY 调查成员或 ISOLATED_WRITE 独立写成员；依赖必须先交付并停止。",
                     schema(Map.of("task", str(), "context", str(), "inputRefs", strings(),
-                            "acceptanceCriteria", strings(), "expectedOutput", str(), "profile", str()), "task"), args -> {
-                        if (!"READ_ONLY".equals(string(args, "profile", "READ_ONLY")))
-                            throw new TeamException("CAPABILITY_DENIED", "第一版只支持 READ_ONLY 成员");
-                        return runtime.spawn(operationKey(), new Task(string(args, "task", ""),
+                            "acceptanceCriteria", strings(), "expectedOutput", str(), "profile", str(), "dependsOn", strings()), "task"), args -> {
+                        Profile profile;
+                        try { profile = Profile.valueOf(string(args, "profile", "READ_ONLY")); }
+                        catch (IllegalArgumentException e) { throw new TeamException("INVALID_ARGUMENT", "未知 profile"); }
+                        List<String> dependencies = list(args, "dependsOn");
+                        if ((profile == Profile.ISOLATED_WRITE || !dependencies.isEmpty()) && workflow == null)
+                            throw new TeamException("CAPABILITY_DENIED", "未配置独立工作区服务");
+                        try (AutoCloseable ignored = runtime.leaseMembers(dependencies)) {
+                            if (workflow != null) workflow.checkDependencies(dependencies);
+                            return runtime.spawn(operationKey(), new Task(string(args, "task", ""),
                                 string(args, "context", ""), list(args, "inputRefs"),
-                                list(args, "acceptanceCriteria"), string(args, "expectedOutput", "")));
+                                list(args, "acceptanceCriteria"), string(args, "expectedOutput", ""), profile, dependencies));
+                        }
                     });
+            add("send_contract_change", "投递需要明确确认的公共契约变更；空闲成员需要 CONTINUE 唤醒。",
+                    schema(Map.of("targetId", str(), "content", str()), "targetId", "content"), args ->
+                            runtime.sendContract(operationKey(), string(args, "targetId", ""), string(args, "content", "")));
+            add("list_contracts", "查看契约消息的投递、呈现及确认状态。", schema(Map.of()), args -> runtime.contracts());
+            add("resolve_contract", "撤回不再适用或被拒绝的契约，必须说明原因；不会伪造接收方确认。",
+                    schema(Map.of("messageId", str(), "reason", str()), "messageId", "reason"), args -> {
+                        runtime.resolveContract(string(args, "messageId", ""), string(args, "reason", ""));
+                        return runtime.contracts();
+                    });
+            if (workflow != null) installIntegrationTools();
             add("send_message", "向成员发送 NOTIFY（当前轮补充）、CONTINUE（下一轮任务）或 ANSWER（回复问题）。",
                     schema(Map.of("targetId", str(), "action", str(), "content", str(), "replyTo", str()),
                             "targetId", "action", "content"), args -> {
@@ -77,6 +103,19 @@ final class TeamToolRegistry extends ToolRegistry {
                         return Map.of("resolved", true);
                     });
         } else {
+            add("acknowledge_contract", "明确接受或拒绝已呈现的契约消息，确认不等于代码已适配。",
+                    schema(Map.of("messageId", str(), "accepted", Map.of("type", "boolean"), "response", str()),
+                            "messageId", "accepted", "response"), args -> {
+                        if (!(args.get("accepted") instanceof Boolean accepted))
+                            throw new TeamException("INVALID_ARGUMENT", "accepted 必须是布尔值");
+                        return runtime.acknowledge(agentId, string(args, "messageId", ""), accepted, string(args, "response", ""));
+                    });
+            if (writer) add("submit_changes", "停止后台写入，提交本工作区全部改动并冻结成果；之后修改须重新交付。",
+                    schema(Map.of("summary", str()), "summary"), args -> {
+                        String blocker = runtime.contractBlocker(agentId);
+                        if (!blocker.isEmpty()) throw new TeamException("CONTRACT_PENDING", blocker);
+                        return workflow.submit(agentId, string(args, "summary", ""));
+                    });
             add("report_to_parent", "报告 PROGRESS，或 QUESTION + needsReply=true 请求暂停等待主 Agent。",
                     schema(Map.of("kind", str(), "content", str(), "needsReply", Map.of("type", "boolean")), "kind", "content"), args -> {
                         Object needsReply = args.getOrDefault("needsReply", false);
@@ -85,6 +124,44 @@ final class TeamToolRegistry extends ToolRegistry {
                                 string(args, "kind", ""), string(args, "content", ""), (Boolean) needsReply));
                     });
         }
+    }
+
+    private void installIntegrationTools() {
+        add("list_workspaces", "查看工作区、固定交付、集成候选和验证证据。", schema(Map.of()), args -> workflow.snapshot());
+        add("build_integration", "在独立集成分支组合已停止成员的固定交付，冲突保留现场；不改用户分支。",
+                schema(Map.of("agentIds", strings()), "agentIds"), args -> {
+                    List<String> ids = list(args, "agentIds");
+                    try (AutoCloseable ignored = runtime.leaseMembers(ids)) { return workflow.build(ids); }
+                });
+        add("integration_command", "在候选目录执行检查/修复命令，保留审批；每次调用撤销旧验证，修复后需提交再验证。",
+                schema(Map.of("candidateId", str(), "command", str()), "candidateId", "command"), args -> {
+                    String id = string(args, "candidateId", "");
+                    var candidate = workflow.candidate(id);
+                    workflow.candidateChanging(id);
+                    return base.forWorkspace(Path.of(candidate.root()), workflow.candidateEnvironment(id), token)
+                            .get("execute_command").executeObserved(Map.of("command", string(args, "command", "")));
+                });
+        add("verify_integration", "执行团队启动时捕获的项目检查策略，验证绑定候选提交；不能指定替代命令。",
+                schema(Map.of("candidateId", str()), "candidateId"), args ->
+                        workflow.verify(string(args, "candidateId", ""), base, token));
+        add("review_integration", "记录 Agent 审查和证据；要求检查通过且输入/目标未变化，不等于人工批准或已合入。",
+                schema(Map.of("candidateId", str(), "evidence", str()), "candidateId", "evidence"), args -> {
+                    String id = string(args, "candidateId", "");
+                    List<String> ids = workflow.candidate(id).inputs().stream().map(TeamWorkspaceService.Change::agentId).toList();
+                    try (AutoCloseable ignored = runtime.leaseMembers(ids)) {
+                        String blocker = runtime.contractBlocker(null);
+                        if (!blocker.isEmpty()) throw new TeamException("CONTRACT_PENDING", blocker);
+                        return workflow.review(id, string(args, "evidence", ""));
+                    }
+                });
+        add("defer_changes", "保留未交付成果并说明原因；团队报告将标记部分完成。成员必须已退出本轮。",
+                schema(Map.of("agentId", str(), "reason", str()), "agentId", "reason"), args -> {
+                    String id = string(args, "agentId", "");
+                    try (AutoCloseable ignored = runtime.leaseMembers(List.of(id))) {
+                        workflow.defer(id, string(args, "reason", ""));
+                        return workflow.snapshot();
+                    }
+                });
     }
 
     AgentRunHooks bind(AgentRunHooks hooks) {
@@ -96,7 +173,22 @@ final class TeamToolRegistry extends ToolRegistry {
             @Override public void beforeTool(ToolCall call) { callId.set(call.id); hooks.beforeTool(call); }
             @Override public boolean pauseRequested() { return hooks.pauseRequested(); }
             @Override public String pauseReason() { return hooks.pauseReason(); }
-            @Override public String finishBlocker() { return hooks.finishBlocker(); }
+            @Override public String finishBlocker() {
+                if (workflow != null) {
+                    String blocker;
+                    if (lead) {
+                        try (AutoCloseable ignored = runtime.leaseMembers(runtime.snapshots().stream().map(Snapshot::agentId).toList())) {
+                            blocker = workflow.finishBlocker();
+                            if (!blocker.isEmpty()) return blocker;
+                            return hooks.finishBlocker();
+                        } catch (Exception e) { return e.getMessage(); }
+                    }
+                    blocker = writer ? workflow.workerBlocker(agentId) : "";
+                    if (!blocker.isEmpty()) return blocker;
+                }
+                String blocker = runtime.contractBlocker(lead ? null : agentId);
+                return blocker.isEmpty() ? hooks.finishBlocker() : blocker;
+            }
             @Override public boolean preserveHistoryOnFailure() { return true; }
         };
     }
@@ -110,7 +202,7 @@ final class TeamToolRegistry extends ToolRegistry {
 
     @Override public synchronized Set<String> names() {
         Set<String> names = new LinkedHashSet<>(super.names());
-        for (String name : base.names()) if (lead || READ_ONLY.contains(name)) names.add(name);
+        for (String name : base.names()) if (allowed(name)) names.add(name);
         return names;
     }
     @Override public boolean isEmpty() { return names().isEmpty(); }
@@ -127,7 +219,7 @@ final class TeamToolRegistry extends ToolRegistry {
     @Override public Tool get(String name) {
         Tool local = super.get(name);
         if (local != null) return local;
-        if (!lead && !READ_ONLY.contains(name)) return null;
+        if (!allowed(name)) return null;
         // 保留原有 HITL 包装；未知能力默认归入主 Agent 独占阶段。
         Tool original = base.get(name);
         if (original == null) return null;
@@ -142,10 +234,18 @@ final class TeamToolRegistry extends ToolRegistry {
                 try {
                     Map<String, Object> scoped = scopedArguments(name, args);
                     if (READ_ONLY.contains(name)) return original.executeObserved(scoped);
+                    if (writer) {
+                        workflow.invalidate(agentId);
+                        return original.executeObserved(scoped);
+                    }
                     try (AutoCloseable lease = runtime.exclusive()) { return original.executeObserved(scoped); }
                 } catch (TeamException e) { return ToolExecutionResult.failure(e.getMessage(), e.code()); }
             }
         };
+    }
+
+    private boolean allowed(String name) {
+        return lead || READ_ONLY.contains(name) || writer && Set.of("write_file", "execute_command").contains(name);
     }
 
     private Map<String, Object> scopedArguments(String name, Map<String, Object> args) throws java.io.IOException {
@@ -167,7 +267,11 @@ final class TeamToolRegistry extends ToolRegistry {
             @Override public String execute(Map<String, Object> args) throws Exception { return executeObserved(args).content(); }
             @Override public ToolExecutionResult executeObserved(Map<String, Object> args) throws Exception {
                 token.throwIfCancellationRequested();
-                try { return ToolExecutionResult.success(TeamJson.write(operation.run(args))); }
+                if (!token.isReusable()) return ToolExecutionResult.failure("上次操作未安全结束", "SIDE_EFFECT_UNKNOWN");
+                try {
+                    Object result = operation.run(args);
+                    return result instanceof ToolExecutionResult execution ? execution : ToolExecutionResult.success(TeamJson.write(result));
+                }
                 catch (TeamException e) { return ToolExecutionResult.failure(e.getMessage(), e.code()); }
             }
         });

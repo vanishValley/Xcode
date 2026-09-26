@@ -11,6 +11,47 @@ import static com.xu.team.TeamTypes.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class TeamRuntimeTest {
+    @Test void contractsRequirePresentationAndExplicitAckAndCanBeWithdrawn() throws Exception {
+        try (TeamRuntime runtime = runtime((rt, id, task, token) -> (input, hooks) -> completed("done"))) {
+            String id = runtime.spawn("spawn", TASK).agentId();
+            untilResults(runtime, 1);
+            Delivery delivery = runtime.sendContract("contract", id, "LoginEvent 增加 result 字段");
+            assertEquals(delivery, runtime.sendContract("contract", id, "重复请求"));
+            assertEquals("QUEUED", runtime.contracts().get(0).status());
+            assertThrows(TeamException.class, () -> runtime.acknowledge(id, delivery.messageId(), true, "accepted"));
+            assertFalse(runtime.contractBlocker(id).isEmpty());
+            assertEquals(1, runtime.hooks(id, false).receive().size());
+            assertEquals("PRESENTED", runtime.contracts().get(0).status());
+            assertThrows(TeamException.class, () -> runtime.acknowledge("other", delivery.messageId(), true, "forged"));
+            runtime.acknowledge(id, delivery.messageId(), false, "需要先明确字段类型");
+            assertFalse(runtime.contractBlocker(id).isEmpty());
+            runtime.resolveContract(delivery.messageId(), "撤回，重新确认类型后再发");
+            assertEquals("", runtime.contractBlocker(id));
+        }
+    }
+
+    @Test void integrationLeasePreventsContinuationUntilReleased() throws Exception {
+        try (TeamRuntime runtime = runtime((rt, id, task, token) -> (input, hooks) -> completed("done"))) {
+            String id = runtime.spawn("spawn", TASK).agentId(); untilResults(runtime, 1);
+            try (AutoCloseable lease = runtime.leaseMembers(List.of(id))) {
+                assertEquals("WORKSPACE_BUSY", assertThrows(TeamException.class,
+                        () -> runtime.send("continue", id, Action.CONTINUE, "change", "")).code());
+            }
+            runtime.send("continue", id, Action.CONTINUE, "change", ""); untilResults(runtime, 2);
+        }
+    }
+
+    @Test void independentWriterDoesNotBlockOriginalWorkspaceExclusivePhase() throws Exception {
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        try (TeamRuntime runtime = runtime((rt, id, task, token) -> (input, hooks) -> {
+            entered.countDown(); release.await(); return completed("done");
+        })) {
+            runtime.spawn("writer", new Task("write", "", List.of(), List.of(), "", Profile.ISOLATED_WRITE, List.of()));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            try (AutoCloseable ignored = runtime.exclusive()) { assertEquals(0, runtime.workspaceEpoch()); }
+            release.countDown(); untilResults(runtime, 1);
+        } finally { release.countDown(); }
+    }
     private static final Task TASK = new Task("调查登录", "已知现象", List.of(), List.of("给出证据"), "结论");
     private static Agent.RunResult completed(String text) {
         return new Agent.RunResult(text, "SUCCESS", 1, 1, 0, 0, false, 10, 5);

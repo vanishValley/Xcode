@@ -17,6 +17,60 @@ import static org.junit.jupiter.api.Assertions.*;
 class TeamCoordinatorTest {
     @TempDir Path directory;
 
+    @Test void isolatedWriterDeliversThenLeadBuildsVerifiesAndReviewsCandidate() throws Exception {
+        Path project = Files.createDirectory(directory.resolve("project"));
+        WorkspaceGit.require(project, "init", "-b", "main");
+        Files.createDirectories(project.resolve(".xcode"));
+        Files.writeString(project.resolve(".xcode/team-workflow.json"),
+                "{\"verificationCommands\":[\"git ls-files --error-unmatch feature.txt\"]}");
+        WorkspaceGit.require(project, "add", "."); WorkspaceGit.require(project, "commit", "-m", "base");
+        String original = WorkspaceGit.head(project);
+        AtomicInteger workerCalls = new AtomicInteger();
+        LlmClient model = new LlmClient("", "fake") {
+            int phase;
+            String member, candidate;
+            private com.fasterxml.jackson.databind.JsonNode output(List<Message> messages, String callId) {
+                String content = messages.stream().filter(m -> callId.equals(m.toolCallId)).reduce((a, b) -> b).orElseThrow().content;
+                try { return TeamJson.MAPPER.readTree(content); }
+                catch (Exception e) { throw new AssertionError(content, e); }
+            }
+            @Override public synchronized Message chatRaw(List<Message> messages, List<Map<String, Object>> tools) {
+                String context = messages.stream().map(m -> Objects.toString(m.content, "")).reduce("", (a, b) -> a + "\n" + b);
+                if (context.contains("你是主 Agent 委派的独立写成员")) {
+                    assertTrue(tools.toString().contains("write_file"));
+                    assertFalse(tools.toString().contains("build_integration"));
+                    return switch (workerCalls.incrementAndGet()) {
+                        case 1 -> reply("write", "write_file", "{\"path\":\"feature.txt\",\"content\":\"isolated\"}");
+                        case 2 -> reply("submit", "submit_changes", "{\"summary\":\"implement feature\"}");
+                        default -> new Message("assistant", "已提交 feature.txt，等待组合验收。");
+                    };
+                }
+                if (phase == 0) { phase++; return reply("spawn", "spawn_agent", "{\"task\":\"实现功能\",\"profile\":\"ISOLATED_WRITE\"}"); }
+                if (phase == 1) {
+                    member = output(messages, "spawn").get("agentId").asText();
+                    if (!context.contains("\"type\":\"RESULT\"")) return reply("wait", "wait_agents", "{\"timeoutMs\":1000}");
+                    phase++; return reply("build", "build_integration", TeamJson.write(Map.of("agentIds", List.of(member))));
+                }
+                if (phase == 2) {
+                    candidate = output(messages, "build").get("id").asText(); phase++;
+                    return reply("verify", "verify_integration", TeamJson.write(Map.of("candidateId", candidate)));
+                }
+                if (phase == 3) {
+                    assertEquals("VERIFIED", output(messages, "verify").get("state").asText()); phase++;
+                    return reply("review", "review_integration", TeamJson.write(Map.of("candidateId", candidate, "evidence", "已审查 feature.txt，固定检查通过")));
+                }
+                assertEquals("REVIEWED", output(messages, "review").get("state").asText());
+                return new Message("assistant", "候选分支已验证和审查；尚未合入 main。");
+            }
+        };
+        String report = new TeamCoordinator(model, new ToolRegistry(), null, null, project, directory.resolve("data"),
+                Tracing.noop(), UiEventSink.noop(), new CancellationToken()).execute("完成一个独立开发任务并验收");
+        assertTrue(report.contains("Team 执行状态：SUCCESS"), report);
+        assertEquals(original, WorkspaceGit.head(project));
+        assertFalse(Files.exists(project.resolve("feature.txt")));
+        assertEquals(3, workerCalls.get());
+    }
+
     @Test void fullTeamFlowScopesWorkerToolsCollectsResultsThenLeadWrites() throws Exception {
         Path project = Files.createDirectory(directory.resolve("project"));
         Path data = directory.resolve("data");

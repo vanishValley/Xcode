@@ -1,6 +1,6 @@
 # Team 协作设计与使用
 
-Team 模式在单 JVM 内运行主 Agent 与独立成员，支持动态委派、消息与任务续接。当前成员只读，修改由主 Agent 集中执行；尚未支持成员互发消息、递归委派或崩溃后自动续跑。
+Team 模式在单 JVM 内运行主 Agent 与独立成员，支持动态委派、消息与任务续接。成员可选择 READ_ONLY 调查或 ISOLATED_WRITE 独立工作区开发；支持固定提交交付、候选组合验收和契约消息确认。尚未支持成员直接互发消息、递归委派或崩溃后自动续跑。完整设计见 [多任务工作区设计](multi-task-workspace-design.md)。
 
 ## 使用
 
@@ -12,7 +12,29 @@ Team 模式在单 JVM 内运行主 Agent 与独立成员，支持动态委派、
 
 一次 `/team` 创建一个临时团队。主 Agent 可以决定不派发小任务，也可以动态创建、通知、继续和停止成员。命令结束后结果以普通对话消息回灌，下一条普通输入不会自动保持 Team 模式。
 
-子 Agent 只使用读取、搜索、Skill 加载和汇报工具；不提供通用 Shell、写文件和未分类 MCP。主 Agent 只有在没有成员处于创建、排队、运行或取消中状态时，才能取得工作区独占租约执行可变操作。不是把 Shell “约定为只读”。
+READ_ONLY 成员只使用读取、搜索、Skill 加载和汇报工具；不提供 Shell、写文件和未分类 MCP。主 Agent 在共享只读成员均已退出本轮时，才能取得原工作区独占租约。独立写成员不占用原工作区的读写阶段，文件工具与 Shell 重绑定到各自 worktree，并继承审批。
+
+### 并行开发与交付
+
+项目需要已有 Git 提交。启动团队前配置 `.xcode/team-workflow.json`：
+
+```json
+{
+  "verificationCommands": ["mvn -B verify"],
+  "verificationTimeoutSeconds": 600
+}
+```
+
+检查策略在团队启动时捕获；没有策略时只能保留成果，不能宣称集成已验证。每条检查命令超时为 1..3600 秒，默认 600 秒，仍受团队总截止时间约束。验证使用宿主已安装的工具链，不复制原目录的 `.env`、未提交修改或依赖目录。
+
+```text
+/team 分别实现登录锁定和审计组件，使用独立写工作区；先协调公共接口，再组合验收并交付候选分支
+```
+
+工具流程：`spawn_agent(profile=ISOLATED_WRITE)` → 成员 `submit_changes` → 主 Agent `build_integration` → `verify_integration` → `review_integration`。
+`dependsOn` 使用已交付且本轮已停止的写成员 ID；未就绪时返回门禁错误，由主 Agent 等待后再派发。`list_workspaces` 返回目录、分支、SHA 和检查结果。冲突候选保留，可用 `integration_command` 修复并提交；此工具使旧验证失效。
+
+`review_integration` 是 Agent 审查记录，不是人工批准；候选分支不会自动合入 main。无法交付的任务先停止，使用 `defer_changes` 说明原因，报告为 PARTIAL。所有 worktree 保留用于审查，不自动删除。
 
 ## 代码入口
 
@@ -23,6 +45,7 @@ Team 模式在单 JVM 内运行主 Agent 与独立成员，支持动态委派、
 | `com.xu.team.TeamToolRegistry` | 主/子角色工具视图、调用身份、路径限制、保留审批链 |
 | `com.xu.team.TeamModelClient` / `TeamBudget` | 共享真实模型客户端，预算预留和结算，包括压缩请求 |
 | `com.xu.team.TeamEventStore` | 单写入者保存事件、结果和团队清单 |
+| `com.xu.team.TeamWorkspaceService` / `WorkspaceGit` | 工作区、固定交付、候选、策略验证和原子工作流快照 |
 | `com.xu.agent.AgentRunHooks` | 请求边界消息输入、暂停、候选最终答案检查 |
 | `MemoryManager.forTeam` | 独立压缩、公共记忆检索，不写普通会话或自动提炼长期记忆 |
 | `CommandProcessor` / `Main` | `/team` 路由与装配，已有普通与 Plan 路径保留 |
@@ -36,6 +59,7 @@ Java 17 的有界 ThreadPoolExecutor 负责执行成员，主 Agent 不占成员
 - `ANSWER`：必须关联有效 questionId；即使回答早于暂停结算到达，也会在下一轮正确处理。
 - `report_to_parent` 的 `QUESTION + needsReply=true`：补全当前工具批次的协议结果，再暂停，不把它当作执行异常回滚。
 - `resolve_question`：记录明确取消或不适用原因。不会伪造用户批准。
+- `send_contract_change` / `acknowledge_contract`：主 Agent 投递公共契约，成员在请求边界看到后明确接受或拒绝。`list_contracts` 查看 QUEUED/PRESENTED/ACCEPTED/REJECTED；`resolve_contract` 撤回契约，不伪造接受。未确认或拒绝的契约阻止交付和完成。
 
 通知和续接分别使用有界队列，每类默认 32 条；ANSWER 保留控制容量，防止消费者因为队列满而无法被唤醒。状态与邮箱在短锁下修改，模型、工具和磁盘 I/O 不在状态锁内执行。
 
@@ -76,11 +100,11 @@ java -Dxcode.team.maxCalls=60 -Dxcode.team.timeoutSeconds=600 -jar target/Xcode-
 
 记录位于 XcodePaths 的项目数据目录下 `teams/<teamId>/`，包含 manifest.json、events.jsonl 和 results。manifest 中有目标、最终状态、成员状态和用量。日志复用脱敏；请求追踪记录运行 ID、请求 ID 和文本中出现的消息引用，供排查，不把引用出现当作可靠的业务处理确认。
 
-记录采用有界异步写入，进程崩溃可能损失尚未刷盘内容。第一版没有 transcript 恢复协议，也不会自动把旧 ACTIVE 团队重新启动。异常退出留下的清单只能作为现场线索，需检查工作区后重新发起任务。日志失败会停止接收新工作，报告记录不完整。
+执行事件采用有界异步写入，进程崩溃可能损失尚未刷盘内容。工作流另在 `workspace-flow/workflow.json` 原子保存工作区和候选状态；重开已有目录返回 RECOVERY_REQUIRED，不自动把旧 ACTIVE 团队重新启动。异常退出留下的记录用于核对现场，不能当作后台进程已结束的证明。日志失败会停止接收新工作，报告记录不完整。
 
 工作区 epoch 仅反映本团队主 Agent 管理的可变操作，不检测外部编辑器或其他进程的修改。根目录 AGENTS.md 在启动时读取并供本团队使用；未实现完整祖先/嵌套规则发现。公共规则文件过大时不自动注入，可在任务中要求主 Agent 读取相关部分。
 
-成员类型、工具视图和结果存储按职责组织。团队部分结果与普通会话回灌已实现，崩溃续跑、子 Agent 编辑和自动评估真实模型收益保留为后续工作。
+成员类型、工具视图和结果存储按职责组织。任务临时目录与 XCODE_RESOURCE_NAMESPACE 已提供；数据库和端口必须由项目命令显式使用该命名空间。工作区不是 OS 沙箱，不能阻止任意 Shell 越界或完全脱离管理的后台进程。透明崩溃续跑、远端 CI/合并队列和自动资源回收需单独接入。
 
 ## 验证
 

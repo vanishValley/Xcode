@@ -222,7 +222,7 @@ public final class CommandProcessor {
             }
             if (command.equals("/team") || command.startsWith("/team ")) {
                 String task = command.substring(5).strip();
-                if (task.isEmpty()) return Result.of(Kind.INFO, "用法：/team <任务描述>（主 Agent 协调只读成员调查，集中修改和验证）");
+                if (task.isEmpty()) return Result.of(Kind.INFO, "用法：/team <任务描述>（只读调查或独立 worktree 并行开发，统一交付和验收）");
                 if (teamCoordinator == null) return Result.of(Kind.WARNING, "当前运行环境未装配 Team 模式");
                 String report = teamCoordinator.execute(task);
                 agent.recordExternalResult("/team " + task, report);
@@ -407,7 +407,7 @@ public final class CommandProcessor {
                   /skill reload         重新扫描 Skills
                   /skill on|off <name>  启用或禁用 Skill
                   /plan <任务>          规划并并行执行复杂任务
-                  /team <任务>          主 Agent 动态委派调查、协调并验证
+                  /team <任务>          动态委派调查或隔离开发，协调并验收
                   /save [-g] <事实>     保存长期记忆
                   /memory               查看长期记忆
                   /memory clear         清空长期记忆
