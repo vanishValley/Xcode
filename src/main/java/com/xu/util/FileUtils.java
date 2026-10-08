@@ -26,10 +26,15 @@ public final class FileUtils {
         if (parent != null) {
             Files.createDirectories(parent);
         }
-        Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
-        Files.write(tmp, content);
-        Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE,
-                StandardCopyOption.REPLACE_EXISTING);
+        // 唯一临时文件避免并发调用争抢同一个 .tmp；不等同于更新版本的 CAS。
+        Path tmp = Files.createTempFile(target.toAbsolutePath().getParent(), ".xcode-write-", ".tmp");
+        try {
+            Files.write(tmp, content);
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
     }
 
     /** 使用 UTF-8 原子写入文本。 */

@@ -18,6 +18,7 @@ logs/
 
 # 项目级 Skills 可纳入版本控制，其余 .xcode 本地数据继续忽略
 .xcode/*
+!.xcode/team-workflow.json
 !.xcode/skills/
 !.xcode/skills/**
 

@@ -29,6 +29,7 @@ public class HitlToolRegistry extends ToolRegistry {
     private final CancellationToken cancellation;
     private final Tracing tracing;
     private volatile boolean enabled = false;
+    private String workspace = "";
 
     public HitlToolRegistry(HitlHandler handler) {
         this(handler, new CancellationToken(), Tracing.noop());
@@ -52,6 +53,14 @@ public class HitlToolRegistry extends ToolRegistry {
 
     public void setEnabled(boolean e) { this.enabled = e; }
     public boolean isEnabled() { return enabled; }
+
+    @Override
+    protected ToolRegistry newWorkspaceRegistry(java.nio.file.Path root, CancellationToken token) {
+        HitlToolRegistry scoped = new HitlToolRegistry(handler, token, tracing);
+        scoped.setEnabled(enabled);
+        scoped.workspace = root.toAbsolutePath().normalize().toString();
+        return scoped;
+    }
 
     /** 清空"全部放行"列表: /clear 或 /hitl off 时调用 */
     public void clearApprovalState() {
@@ -89,8 +98,9 @@ public class HitlToolRegistry extends ToolRegistry {
                 try (TraceScope scope = tracing.start("hitl.wait")
                         .attribute("tool.name", original.name())
                         .attribute("hitl.danger_level", dangerLevel)) {
-                    result = handler.requestApproval(
-                            original.name(), arguments);
+                    Map<String, Object> approvalArguments = new java.util.LinkedHashMap<>(arguments);
+                    if (!workspace.isBlank()) approvalArguments.put("workspace", workspace);
+                    result = handler.requestApproval(original.name(), approvalArguments);
                     scope.attribute("hitl.decision", result.type().name());
 
                     // 审批内容可能包含命令或源码，这里只记录决策和等待时间。

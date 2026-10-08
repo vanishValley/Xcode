@@ -13,6 +13,32 @@ public class ToolRegistry {
 
     private final Map<String, Tool> tools = new LinkedHashMap<>();
 
+    /** 为独立工作区创建新工具实例；未知 MCP 不继承，避免仍指向主工作区。 */
+    public ToolRegistry forWorkspace(java.nio.file.Path root, Map<String, String> environment,
+                                     com.xu.util.CancellationToken cancellation) {
+        return forWorkspace(root, environment, cancellation, 60);
+    }
+
+    public ToolRegistry forWorkspace(java.nio.file.Path root, Map<String, String> environment,
+                                     com.xu.util.CancellationToken cancellation, int timeoutSeconds) {
+        ToolRegistry scoped = newWorkspaceRegistry(root, cancellation);
+        scoped.register(new com.xu.tool.impl.ReadFileTool());
+        scoped.register(new com.xu.tool.impl.ListDirTool());
+        scoped.register(new com.xu.tool.impl.GlobFilesTool(root));
+        scoped.register(new com.xu.tool.impl.WriteFileTool(root));
+        scoped.register(new com.xu.tool.impl.ExecuteCommandTool(root, environment, timeoutSeconds));
+        for (String name : List.of("web_search", "web_fetch", "load_skill")) {
+            Tool tool = get(name);
+            if (tool != null) scoped.register(tool);
+        }
+        return scoped;
+    }
+
+    /** 审批注册表覆写此工厂，重绑定目录时不能丢掉执行策略。 */
+    protected ToolRegistry newWorkspaceRegistry(java.nio.file.Path root, com.xu.util.CancellationToken cancellation) {
+        return new ToolRegistry();
+    }
+
     /**
      * 注册一个工具。
      *
